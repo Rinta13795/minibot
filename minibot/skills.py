@@ -18,16 +18,18 @@ SKILL.md frontmatter 示例：
     当用户打招呼时...
 
 加载策略：
-    - 启动时扫描 workspace/skills/，解析所有 SKILL.md 的 frontmatter。
-    - always=true 的技能始终激活。
-    - 其他技能按需激活（core 可通过 LLM 自主决策或显式调用）。
+    - 启动时扫描所有配置的 skills_dirs（支持多目录），收集每个子目录下的 SKILL.md。
+    - 解析 frontmatter（YAML），缺失或损坏的 SKILL.md 跳过并打印 warning，不影响其他技能。
+    - always=true 的技能始终激活；其他技能按需挂载。
+    - 输出格式遵循 Task 4 约定：用 `---` 分隔的中文模板。
 """
 
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
@@ -35,135 +37,128 @@ import yaml
 class SkillsLoader:
     """扫描 skills 目录，按需把 SKILL.md 注入 system prompt。"""
 
-    def __init__(self, skills_dir: Path) -> None:
+    def __init__(self, skills_dirs: Path | Iterable[Path]) -> None:
         """初始化加载器。
 
         Args:
-            skills_dir: 技能根目录，如 workspace / "skills"。
-
-        TODO:
-            - self.skills_dir = skills_dir
-            - self._cache: dict[str, dict] = {}  # name -> {meta, body, path}
-            - 立即扫描一次（self._scan）
+            skills_dirs: 单个 Path 或 Path 列表。多目录会按顺序扫描，重名以先扫到的为准。
         """
-        self.skills_dir = skills_dir
+        if isinstance(skills_dirs, Path):
+            self.skills_dirs: list[Path] = [skills_dirs]
+        else:
+            self.skills_dirs = list(skills_dirs)
         self._cache: dict[str, dict[str, Any]] = {}
         self._scan()
 
+    @property
+    def skills_dir(self) -> Path:
+        """向后兼容：返回第一个目录（如有），否则 Path(".")。"""
+        return self.skills_dirs[0] if self.skills_dirs else Path(".")
+
     def _scan(self) -> None:
-        """遍历 skills_dir 下所有子目录的 SKILL.md，填充 self._cache。
-
-        TODO:
-            - for sub in skills_dir.iterdir(): if (sub / "SKILL.md").exists(): parse
-            - 解析 frontmatter（yaml.safe_load）和正文
-        """
+        """遍历所有 skills_dirs 下的子目录，解析每个 SKILL.md 并缓存。"""
         self._cache = {}
-        if not self.skills_dir.exists():
-            return
-
-        for sub in sorted(self.skills_dir.iterdir()):
-            skill_md = sub / "SKILL.md"
-            if not sub.is_dir() or not skill_md.exists():
+        for root in self.skills_dirs:
+            if not root.exists() or not root.is_dir():
                 continue
-            meta, body = self._parse_skill_md(skill_md)
-            name = str(meta.get("name") or sub.name)
-            self._cache[name] = {
-                "name": name,
-                "description": meta.get("description", ""),
-                "always": bool(meta.get("always", False)),
-                "body": body.strip(),
-                "path": skill_md,
-            }
+            for sub in sorted(root.iterdir()):
+                skill_md = sub / "SKILL.md"
+                if not sub.is_dir() or not skill_md.exists():
+                    continue
+                try:
+                    meta, body = self._parse_skill_md(skill_md)
+                except Exception as exc:
+                    print(
+                        f"[skills] skipping {skill_md}: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+                # 技能名优先取 frontmatter 的 name，缺失时回退到文件夹名
+                name = str(meta.get("name") or sub.name).strip() or sub.name
+                if name in self._cache:
+                    # 重名：保留先扫到的，跳过后续的
+                    print(
+                        f"[skills] duplicate skill name '{name}' from {skill_md}, ignoring",
+                        file=sys.stderr,
+                    )
+                    continue
+                self._cache[name] = {
+                    "name": name,
+                    "description": str(meta.get("description", "")),
+                    "always": bool(meta.get("always", False)),
+                    "body": body.strip(),
+                    "path": skill_md,
+                }
 
     @staticmethod
     def _parse_skill_md(path: Path) -> tuple[dict[str, Any], str]:
         """切分 SKILL.md 的 YAML frontmatter 和正文。
 
-        Args:
-            path: SKILL.md 路径。
-
-        Returns:
-            (metadata_dict, body_str)；frontmatter 缺失时 metadata 为 {}。
-
-        TODO:
-            - 用正则 r"^---\\n(.*?)\\n---\\n(.*)$" + DOTALL 匹配
-            - yaml.safe_load(frontmatter)
+        frontmatter 缺失或格式不对时返回 ({}, 全文)，由调用方决定如何处理。
         """
         text = path.read_text(encoding="utf-8")
         match = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, flags=re.DOTALL)
         if not match:
             return {}, text.strip()
 
-        metadata = yaml.safe_load(match.group(1)) or {}
+        try:
+            metadata = yaml.safe_load(match.group(1)) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"invalid YAML frontmatter: {exc}") from exc
         if not isinstance(metadata, dict):
-            metadata = {}
+            raise ValueError(f"frontmatter must be a mapping, got {type(metadata).__name__}")
         body = match.group(2).strip()
         return metadata, body
 
+    # ---------- 对外 API ----------
+
     def list_skills(self) -> list[dict[str, Any]]:
-        """返回所有已发现的技能元信息。
-
-        Returns:
-            列表，每个元素形如：
-                {"name": "greeting", "description": "...", "always": False}
-
-        TODO: 从 self._cache 提取
-        """
+        """返回所有已发现的技能元信息。"""
         return [
             {
-                "name": name,
-                "description": data.get("description", ""),
-                "always": bool(data.get("always", False)),
+                "name": data["name"],
+                "description": data["description"],
+                "always": data["always"],
             }
-            for name, data in self._cache.items()
+            for data in self._cache.values()
         ]
 
     def get_always_skills(self) -> list[str]:
-        """返回所有 always=true 的技能名。
-
-        Returns:
-            名称列表。
-
-        TODO: 过滤 self._cache
-        """
+        """返回所有 always=true 的技能名。"""
         return [name for name, data in self._cache.items() if data.get("always")]
 
     def load_skill_body(self, name: str) -> str:
-        """读取指定技能的正文（不含 frontmatter）。
-
-        Args:
-            name: 技能名。
-
-        Returns:
-            正文字符串；技能不存在返回 ""。
-
-        TODO: self._cache[name]["body"]
-        """
+        """读取指定技能的正文（不含 frontmatter）。"""
         return str(self._cache.get(name, {}).get("body", ""))
 
+    def has_skill(self, name: str) -> bool:
+        return name in self._cache
+
     def build_skills_block(self, active_skills: list[str]) -> str:
-        """把若干技能正文拼成一段可嵌入 system prompt 的文本。
+        """把若干技能正文拼成可嵌入 system prompt 的文本（Task 4 格式）。
 
-        Args:
-            active_skills: 要挂载的技能名列表。
+        输出形如：
+            ---
+            以下是你可用的技能：
 
-        Returns:
-            拼好的字符串，例：
-                "# Skills\\n\\n## greeting\\n<body>\\n\\n## farewell\\n<body>"
+            ### 技能：greeting
+            <SKILL.md 正文>
 
-        TODO: 实现拼接，跳过不存在的 skill
+            ### 技能：farewell
+            <SKILL.md 正文>
+            ---
         """
         seen: set[str] = set()
         sections: list[str] = []
         for name in active_skills:
-            if name in seen:
+            if name in seen or not self.has_skill(name):
                 continue
             seen.add(name)
             body = self.load_skill_body(name).strip()
             if not body:
                 continue
-            sections.append(f"## {name}\n{body}")
+            sections.append(f"### 技能：{name}\n{body}")
 
         if not sections:
             return ""
-        return "# Skills\n\n" + "\n\n".join(sections)
+        return "---\n以下是你可用的技能：\n\n" + "\n\n".join(sections) + "\n---"
