@@ -62,10 +62,15 @@ class MiniBotCore:
         # Memory
         self.memory = MemoryStore(workspace)
 
-        # Skills — try workspace-relative then config-relative then cwd-relative
+        # Skills — 支持 skills_dirs (list) 或 skills_dir (single, 向后兼容)
         skills_cfg = config.get("skills", {})
-        skills_dir = self._resolve_path(skills_cfg.get("skills_dir", "./skills"), workspace)
-        self.skills = SkillsLoader(skills_dir)
+        skills_dirs_raw = skills_cfg.get("skills_dirs")
+        if skills_dirs_raw is None:
+            skills_dirs_raw = [skills_cfg.get("skills_dir", "./skills")]
+        elif isinstance(skills_dirs_raw, str):
+            skills_dirs_raw = [skills_dirs_raw]
+        skills_dirs = [self._resolve_path(p, workspace) for p in skills_dirs_raw]
+        self.skills = SkillsLoader(skills_dirs)
 
         # MCP client
         mcp_servers = [
