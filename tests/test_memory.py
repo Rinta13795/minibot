@@ -1,7 +1,9 @@
-"""tests/test_memory.py — MEMORY.md 读写测试骨架。"""
+"""tests/test_memory.py — MEMORY.md 读写测试。"""
 
 from __future__ import annotations
 
+import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -11,56 +13,108 @@ from minibot.memory import MemoryStore
 
 class TestMemoryStore:
     def test_init_creates_empty_memory_file(self, tmp_path: Path) -> None:
-        """首次构造时若 MEMORY.md 不存在，应自动创建带默认 section 的空文件。"""
-        # TODO:
-        # store = MemoryStore(workspace=tmp_path)
-        # assert (tmp_path / "MEMORY.md").exists()
-        # for s in store.DEFAULT_SECTIONS:
-        #     assert f"## {s}" in store.read_all()
-        pytest.skip("TODO")
+        store = MemoryStore(workspace=tmp_path)
+        assert (tmp_path / "MEMORY.md").exists()
+        for s in store.DEFAULT_SECTIONS:
+            assert f"## {s}" in store.read_all()
 
     def test_read_section_returns_only_section_body(self, tmp_path: Path) -> None:
-        """read_section 应只返回目标 section 的正文，不含其他 section 和标题。"""
-        # TODO:
-        # 准备一个含两个 section 的 MEMORY.md
-        # 断言 read_section("user") 不含 "## project" 的内容
-        pytest.skip("TODO")
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", "alice")
+        store.write_section("project", "minibot")
+        assert store.read_section("user") == "alice"
+        assert "minibot" not in store.read_section("user")
 
     def test_write_section_replaces_existing(self, tmp_path: Path) -> None:
-        """write_section 已存在的 section 时应原地替换，不影响其他 section。"""
-        # TODO:
-        # 写入 project section 新内容后，user section 应保持原样
-        pytest.skip("TODO")
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", "alice")
+        store.write_section("project", "minibot")
+        store.write_section("project", "minibot v2")
+        assert store.read_section("user") == "alice"
+        assert store.read_section("project") == "minibot v2"
 
     def test_write_section_appends_when_missing(self, tmp_path: Path) -> None:
-        """写入不存在的 section 时应追加到文件末尾，且 list_sections 能列出。"""
-        # TODO:
-        # store.write_section("custom_topic", "x")
-        # assert "custom_topic" in store.list_sections()
-        pytest.skip("TODO")
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("custom_topic", "x")
+        assert "custom_topic" in store.list_sections()
+        assert store.read_section("custom_topic") == "x"
 
     def test_append_section_preserves_existing_lines(self, tmp_path: Path) -> None:
-        """append_section 应保留原有内容，只在末尾加一行。"""
-        # TODO:
-        # 先 write_section 一段，再 append_section 一行
-        # 断言原内容 + 新行都在
-        pytest.skip("TODO")
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("project", "line1")
+        store.append_section("project", "line2")
+        body = store.read_section("project")
+        assert "line1" in body and "line2" in body
 
-    def test_atomic_write_no_partial_on_crash(self, tmp_path: Path, monkeypatch) -> None:
-        """模拟写 tmp 后 rename 前崩溃，原文件应保持完整（原子写保障）。"""
-        # TODO:
-        # monkeypatch os.replace 抛异常
-        # 断言原文件内容未变
-        pytest.skip("TODO")
+    def test_append_entry_adds_timestamp(self, tmp_path: Path) -> None:
+        store = MemoryStore(workspace=tmp_path)
+        store.append_entry("feedback", "用户偏好简短回答")
+        body = store.read_section("feedback")
+        # ISO-8601 like 2025-01-01T12:34:56
+        assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", body)
+        assert "用户偏好简短回答" in body
 
     def test_get_context_block_returns_empty_when_no_content(self, tmp_path: Path) -> None:
-        """所有 section 都为空时，get_context_block 应返回空串，避免污染 prompt。"""
-        # TODO:
-        # store = MemoryStore(workspace=tmp_path)
-        # assert store.get_context_block() == ""
-        pytest.skip("TODO")
+        store = MemoryStore(workspace=tmp_path)
+        assert store.get_context_block() == ""
+
+    def test_get_context_block_includes_non_empty_sections(self, tmp_path: Path) -> None:
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", "alice")
+        block = store.get_context_block()
+        assert "alice" in block
+        assert "## user" in block
 
     def test_list_sections_order_matches_file(self, tmp_path: Path) -> None:
-        """list_sections 的顺序应和文件中 ## 标题出现的顺序一致。"""
-        # TODO
-        pytest.skip("TODO")
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", "u")
+        store.write_section("project", "p")
+        store.write_section("zeta", "z")
+        sections = store.list_sections()
+        # zeta 是新追加，应在末尾
+        assert sections.index("zeta") > sections.index("project")
+
+    def test_empty_file_does_not_crash(self, tmp_path: Path) -> None:
+        memory = tmp_path / "MEMORY.md"
+        memory.write_text("", encoding="utf-8")
+        store = MemoryStore(workspace=tmp_path)
+        # 空文件 — read_section 应安全返回空串
+        assert store.read_section("user") == ""
+        assert store.list_sections() == []
+
+    def test_section_with_chinese_name(self, tmp_path: Path) -> None:
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("用户偏好", "中文 section 名")
+        assert "用户偏好" in store.list_sections()
+        assert store.read_section("用户偏好") == "中文 section 名"
+
+    def test_section_name_with_spaces(self, tmp_path: Path) -> None:
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("my topic", "body")
+        assert "my topic" in store.list_sections()
+        assert store.read_section("my topic") == "body"
+
+    def test_concurrent_writes_serialized(self, tmp_path: Path) -> None:
+        """20 个线程并发 append_entry，最终应留下 20 条记录（无丢失）。"""
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("feedback", "")
+
+        def worker(i: int) -> None:
+            store.append_entry("feedback", f"entry-{i}")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        body = store.read_section("feedback")
+        for i in range(20):
+            assert f"entry-{i}" in body, f"lost entry-{i}"
+
+    def test_aliases(self, tmp_path: Path) -> None:
+        """Task 3 接口（read_memory / get_section / update_section）应与原接口等价。"""
+        store = MemoryStore(workspace=tmp_path)
+        store.update_section("user", "alice")
+        assert store.get_section("user") == "alice"
+        assert "alice" in store.read_memory()
