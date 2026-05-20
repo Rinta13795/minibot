@@ -14,6 +14,10 @@
 
 from __future__ import annotations
 
+import os
+import shlex
+import subprocess
+import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -62,7 +66,11 @@ class Tool(ABC):
 
         TODO: 实现序列化
         """
-        raise NotImplementedError("TODO: to_schema")
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.parameters,
+        }
 
 
 # ============================================================
@@ -95,7 +103,11 @@ class ExecTool(Tool):
 
         TODO: 保存参数；校验 workspace 存在
         """
-        raise NotImplementedError("TODO: ExecTool.__init__")
+        self.cmd_whitelist = set(cmd_whitelist)
+        self.workspace = workspace.resolve()
+        self.timeout_sec = timeout_sec
+        if not self.workspace.exists() or not self.workspace.is_dir():
+            raise ValueError(f"workspace does not exist: {self.workspace}")
 
     @property
     def name(self) -> str:
@@ -108,7 +120,16 @@ class ExecTool(Tool):
     @property
     def parameters(self) -> dict[str, Any]:
         """TODO: 返回 {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}"""
-        raise NotImplementedError("TODO: parameters")
+        return {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Command string to execute.",
+                }
+            },
+            "required": ["command"],
+        }
 
     def execute(self, **kwargs: Any) -> str:
         """执行命令。
@@ -127,7 +148,43 @@ class ExecTool(Tool):
 
         TODO: 实现命令执行 + 异常捕获
         """
-        raise NotImplementedError("TODO: ExecTool.execute")
+        command = kwargs.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return "Error: missing command"
+
+        try:
+            tokens = shlex.split(command)
+        except ValueError as exc:
+            return f"Error: invalid command: {exc}"
+
+        if not tokens:
+            return "Error: empty command"
+        if not self._is_whitelisted(command):
+            return "Error: command not allowed"
+
+        try:
+            result = subprocess.run(
+                tokens,
+                cwd=self.workspace,
+                timeout=self.timeout_sec,
+                capture_output=True,
+                text=True,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return f"Error: command timed out after {self.timeout_sec}s"
+        except Exception as exc:  # pragma: no cover - defensive
+            return f"Error: command failed: {exc}"
+
+        stdout = result.stdout.rstrip()
+        stderr = result.stderr.rstrip()
+        return "\n".join(
+            [
+                f"stdout: {stdout}" if stdout else "stdout:",
+                f"stderr: {stderr}" if stderr else "stderr:",
+                f"returncode: {result.returncode}",
+            ]
+        )
 
     def _is_whitelisted(self, command: str) -> bool:
         """判断命令是否在白名单内。
@@ -140,7 +197,11 @@ class ExecTool(Tool):
 
         TODO: shlex.split → tokens[0] in self.cmd_whitelist
         """
-        raise NotImplementedError("TODO: _is_whitelisted")
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return False
+        return bool(tokens) and tokens[0] in self.cmd_whitelist
 
 
 class ReadFileTool(Tool):
@@ -155,7 +216,8 @@ class ReadFileTool(Tool):
 
         TODO: resolve() 所有 allowed_paths，存为 set
         """
-        raise NotImplementedError("TODO: ReadFileTool.__init__")
+        self.allowed_paths = {path.resolve() for path in allowed_paths}
+        self.max_bytes = max_bytes
 
     @property
     def name(self) -> str:
@@ -168,7 +230,16 @@ class ReadFileTool(Tool):
     @property
     def parameters(self) -> dict[str, Any]:
         """TODO: properties={"path": {"type": "string"}}, required=["path"]"""
-        raise NotImplementedError("TODO: parameters")
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path to read.",
+                }
+            },
+            "required": ["path"],
+        }
 
     def execute(self, **kwargs: Any) -> str:
         """读取并返回文件内容。
@@ -180,7 +251,27 @@ class ReadFileTool(Tool):
 
         TODO: 实现读文件 + 截断 + UnicodeDecodeError 兜底
         """
-        raise NotImplementedError("TODO: ReadFileTool.execute")
+        path = kwargs.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return "Error: missing path"
+
+        target = Path(path).resolve(strict=False)
+        if not self._check_path_allowed(target):
+            return "Error: path not allowed"
+        if not target.exists() or not target.is_file():
+            return "Error: file not found"
+
+        try:
+            content = target.read_bytes()
+        except Exception as exc:
+            return f"Error: failed to read file: {exc}"
+
+        truncated = len(content) > self.max_bytes
+        content = content[: self.max_bytes]
+        text = content.decode("utf-8", errors="replace")
+        if truncated:
+            text += "\n\n[truncated]"
+        return text
 
     def _check_path_allowed(self, target: Path) -> bool:
         """判断目标路径是否落在某个 allowed_paths 子树内。
@@ -189,7 +280,7 @@ class ReadFileTool(Tool):
 
         TODO: 用 Path.is_relative_to() 或手动 commonpath 检查
         """
-        raise NotImplementedError("TODO: _check_path_allowed")
+        return any(target.is_relative_to(base) for base in self.allowed_paths)
 
 
 class WriteFileTool(Tool):
@@ -209,7 +300,10 @@ class WriteFileTool(Tool):
 
         TODO: 保存参数；resolve()
         """
-        raise NotImplementedError("TODO: WriteFileTool.__init__")
+        self.allowed_paths = {path.resolve() for path in allowed_paths}
+        self.forbidden_extensions = {
+            ext.lower() for ext in (forbidden_extensions or []) if ext
+        }
 
     @property
     def name(self) -> str:
@@ -222,7 +316,20 @@ class WriteFileTool(Tool):
     @property
     def parameters(self) -> dict[str, Any]:
         """TODO: properties={"path","content"} required=["path","content"]"""
-        raise NotImplementedError("TODO: parameters")
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Target file path.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "UTF-8 text content to write.",
+                },
+            },
+            "required": ["path", "content"],
+        }
 
     def execute(self, **kwargs: Any) -> str:
         """把 content 写入 path。
@@ -234,7 +341,39 @@ class WriteFileTool(Tool):
 
         TODO: 实现原子写
         """
-        raise NotImplementedError("TODO: WriteFileTool.execute")
+        path = kwargs.get("path")
+        content = kwargs.get("content")
+        if not isinstance(path, str) or not path.strip():
+            return "Error: missing path"
+        if not isinstance(content, str):
+            return "Error: missing content"
+
+        target = Path(path).resolve(strict=False)
+        if not any(target.is_relative_to(base) for base in self.allowed_paths):
+            return "Error: path not allowed"
+        if any(target.name.lower().endswith(ext) for ext in self.forbidden_extensions):
+            return "Error: forbidden file extension"
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_file.write(content)
+                tmp_name = tmp_file.name
+            os.replace(tmp_name, target)
+        except Exception as exc:
+            if tmp_name:
+                Path(tmp_name).unlink(missing_ok=True)
+            return f"Error: failed to write file: {exc}"
+
+        return f"Wrote {len(content)} characters to {target}"
 
 
 # ============================================================
@@ -253,21 +392,21 @@ class ToolRegistry:
 
         TODO: self._tools: dict[str, Tool] = {}
         """
-        raise NotImplementedError("TODO: __init__")
+        self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
         """注册一个工具。
 
         TODO: self._tools[tool.name] = tool
         """
-        raise NotImplementedError("TODO: register")
+        self._tools[tool.name] = tool
 
     def get_schemas(self) -> list[dict[str, Any]]:
         """返回所有工具的 Anthropic schemas 列表，传给 messages.create(tools=...)。
 
         TODO: [t.to_schema() for t in self._tools.values()]
         """
-        raise NotImplementedError("TODO: get_schemas")
+        return [tool.to_schema() for tool in self._tools.values()]
 
     def execute(self, name: str, params: dict[str, Any]) -> str:
         """根据 name 找工具并执行，返回字符串结果。
@@ -281,4 +420,10 @@ class ToolRegistry:
 
         TODO: 实现查找 + 调用 + 异常兜底
         """
-        raise NotImplementedError("TODO: execute")
+        tool = self._tools.get(name)
+        if tool is None:
+            return "Error: tool not found"
+        try:
+            return tool.execute(**params)
+        except Exception as exc:  # pragma: no cover - defensive
+            return f"Error: tool execution failed: {exc}"

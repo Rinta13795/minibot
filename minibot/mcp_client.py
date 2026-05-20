@@ -20,6 +20,7 @@ config.json 里的配置示例：
 
 from __future__ import annotations
 
+import json
 import subprocess
 from typing import Any
 
@@ -28,107 +29,125 @@ class MCPServerConfig:
     """单个 MCP Server 的启动配置（值对象）。"""
 
     def __init__(self, name: str, command: str, args: list[str]) -> None:
-        """记录启动一个 MCP Server 所需的全部信息。
-
-        Args:
-            name: 服务器名（用作工具名前缀，如 "mcp_filesystem_read_file"）。
-            command: 可执行命令，如 "npx" / "python3"。
-            args: 命令行参数。
-
-        TODO: 简单 assign
-        """
-        raise NotImplementedError("TODO: __init__")
+        self.name = name
+        self.command = command
+        self.args = args
 
 
 class MCPClient:
     """管理多个 MCP Server 子进程，把它们暴露的工具桥接到 ToolRegistry。"""
 
     def __init__(self, servers: list[MCPServerConfig], timeout_sec: int = 30) -> None:
-        """初始化 MCP 客户端。
-
-        Args:
-            servers: 要启动的 MCP 服务器列表。
-            timeout_sec: 单次 RPC 调用超时。
-
-        TODO:
-            - self._servers = servers
-            - self._processes: dict[str, subprocess.Popen] = {}
-            - self._tool_cache: dict[str, list[dict]] = {}  # server_name -> tools
-            - self._request_id = 0
-        """
-        raise NotImplementedError("TODO: __init__")
+        self._servers = servers
+        self._processes: dict[str, subprocess.Popen] = {}
+        self._tool_cache: dict[str, list[dict[str, Any]]] = {}
+        self._request_id = 0
+        self.timeout_sec = timeout_sec
 
     def start_all(self) -> None:
-        """启动所有 MCP Server 子进程并完成 initialize 握手。
+        """启动所有 MCP Server 子进程并完成 initialize 握手。"""
+        for srv in self._servers:
+            proc = subprocess.Popen(
+                [srv.command] + srv.args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            self._processes[srv.name] = proc
 
-        TODO:
-            - 遍历 servers，用 subprocess.Popen 启动每个进程
-            - stdin/stdout 配 PIPE，stderr 走 DEVNULL（或单独日志）
-            - 发送 initialize JSON-RPC 请求，等握手响应
-            - 发送 tools/list 拉取工具清单，存到 self._tool_cache
-        """
-        raise NotImplementedError("TODO: start_all")
+            # initialize handshake
+            self._send_request(srv.name, "initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "minibot", "version": "0.1.0"},
+            })
+
+            # fetch tool list
+            result = self._send_request(srv.name, "tools/list", {})
+            self._tool_cache[srv.name] = result.get("tools", [])
 
     def close_all(self) -> None:
-        """关闭所有子进程。
-
-        TODO:
-            - 给每个 process.stdin 发送 shutdown 通知
-            - process.terminate() + wait(timeout)
-            - 超时则 kill
-        """
-        raise NotImplementedError("TODO: close_all")
+        """关闭所有子进程。"""
+        for name, proc in self._processes.items():
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._processes = {}
 
     # ---------- JSON-RPC ----------
 
     def _send_request(self, server_name: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """向指定 Server 发送一条 JSON-RPC 请求并阻塞等待响应。
+        """向指定 Server 发送一条 JSON-RPC 请求并阻塞等待响应。"""
+        proc = self._processes.get(server_name)
+        if proc is None:
+            raise RuntimeError(f"MCP server '{server_name}' not started")
 
-        Args:
-            server_name: 目标 server 名（必须已 start）。
-            method: JSON-RPC 方法名，如 "tools/call"。
-            params: 参数对象。
+        self._request_id += 1
+        body = {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": method,
+            "params": params,
+        }
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(body) + "\n")
+        proc.stdin.flush()
 
-        Returns:
-            响应的 "result" 字段。
-
-        TODO:
-            - self._request_id += 1
-            - body = {"jsonrpc":"2.0","id":...,"method":...,"params":...}
-            - proc.stdin.write(json.dumps(body) + "\\n") + flush
-            - 循环 readline，找到 id 匹配的响应
-            - 解析 "result" / "error"，error 时 raise
-        """
-        raise NotImplementedError("TODO: _send_request")
+        assert proc.stdout is not None
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError(f"MCP server '{server_name}' closed connection unexpectedly")
+            resp = json.loads(line.strip())
+            if resp.get("id") == self._request_id:
+                if "error" in resp:
+                    raise RuntimeError(f"MCP error from '{server_name}': {resp['error']}")
+                return resp.get("result", {})
 
     # ---------- 对外 API ----------
 
     def list_tools(self) -> list[dict[str, Any]]:
         """汇总所有 MCP Server 的工具，转成 Anthropic tool schema 列表。
 
-        Returns:
-            [{"name": "mcp_filesystem_read_file", "description": ..., "input_schema": ...}, ...]
-            注意：name 加 mcp_<server>_ 前缀，避免和内置工具同名。
-
-        TODO:
-            - 遍历 self._tool_cache
-            - 每个工具构造前缀化的 schema
+        工具名加 mcp_<server>_ 前缀，避免与内置工具同名。
         """
-        raise NotImplementedError("TODO: list_tools")
+        schemas: list[dict[str, Any]] = []
+        for server_name, tools in self._tool_cache.items():
+            for tool in tools:
+                schemas.append({
+                    "name": f"mcp_{server_name}_{tool['name']}",
+                    "description": tool.get("description", ""),
+                    "input_schema": tool.get("inputSchema", {"type": "object", "properties": {}}),
+                })
+        return schemas
 
     def call_tool(self, prefixed_name: str, arguments: dict[str, Any]) -> str:
         """调用一个 MCP 工具，返回字符串结果。
 
-        Args:
-            prefixed_name: 形如 "mcp_filesystem_read_file"。
-            arguments: 工具参数。
-
-        Returns:
-            工具返回的文本内容（多个 content 块合并）。
-
-        TODO:
-            - 从 prefixed_name 解析出 server_name 和 original_tool_name
-            - _send_request("tools/call", {"name": ..., "arguments": ...})
-            - 把 content 列表里的 text 块拼起来返回
+        prefixed_name 形如 "mcp_filesystem_read_file"。
         """
-        raise NotImplementedError("TODO: call_tool")
+        # Format: mcp_<server>_<tool>  (server name may not contain underscores by convention)
+        parts = prefixed_name.split("_", 2)
+        if len(parts) < 3 or parts[0] != "mcp":
+            return f"Error: invalid MCP tool name '{prefixed_name}'"
+
+        server_name = parts[1]
+        tool_name = parts[2]
+
+        try:
+            result = self._send_request(server_name, "tools/call", {
+                "name": tool_name,
+                "arguments": arguments,
+            })
+        except Exception as exc:
+            return f"Error: MCP call failed: {exc}"
+
+        content = result.get("content", [])
+        texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        return "\n".join(texts) if texts else str(result)

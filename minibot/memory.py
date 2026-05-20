@@ -19,6 +19,8 @@ MEMORY.md 的格式约定（受 Claude Code 的 memory 启发）：
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 
 
@@ -40,7 +42,10 @@ class MemoryStore:
             - self.memory_path = workspace / "MEMORY.md"
             - 若不存在，创建空文件并写入默认 section 框架
         """
-        raise NotImplementedError("TODO: __init__")
+        workspace.mkdir(parents=True, exist_ok=True)
+        self.memory_path = workspace / "MEMORY.md"
+        if not self.memory_path.exists():
+            self.write_all(self._render_sections([(name, "") for name in self.DEFAULT_SECTIONS]))
 
     # ---------- 整文件 ----------
 
@@ -52,7 +57,9 @@ class MemoryStore:
 
         TODO: self.memory_path.read_text(encoding="utf-8") 兜底
         """
-        raise NotImplementedError("TODO: read_all")
+        if not self.memory_path.exists():
+            return ""
+        return self.memory_path.read_text(encoding="utf-8")
 
     def write_all(self, content: str) -> None:
         """覆盖整份 MEMORY.md（原子写）。
@@ -64,7 +71,10 @@ class MemoryStore:
             - 写 tmp 文件 → os.replace 到目标路径
             - 防止半截写入污染记忆
         """
-        raise NotImplementedError("TODO: write_all")
+        self.memory_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.memory_path.with_suffix(".tmp")
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, self.memory_path)
 
     # ---------- 按 section 操作 ----------
 
@@ -81,7 +91,10 @@ class MemoryStore:
             - 用正则切分 ## 标题
             - 取目标 section 到下一个 ## 之间的内容
         """
-        raise NotImplementedError("TODO: read_section")
+        for name, body in self._parse_sections(self.read_all()):
+            if name == section:
+                return body.strip()
+        return ""
 
     def write_section(self, section: str, content: str) -> None:
         """覆盖某个 section 的内容；section 不存在则追加到文件末尾。
@@ -95,7 +108,19 @@ class MemoryStore:
             - 替换或追加目标 section
             - write_all()
         """
-        raise NotImplementedError("TODO: write_section")
+        sections = self._parse_sections(self.read_all())
+        normalized = content.strip()
+        updated = False
+        new_sections: list[tuple[str, str]] = []
+        for name, body in sections:
+            if name == section:
+                new_sections.append((section, normalized))
+                updated = True
+            else:
+                new_sections.append((name, body))
+        if not updated:
+            new_sections.append((section, normalized))
+        self.write_all(self._render_sections(new_sections))
 
     def append_section(self, section: str, line: str) -> None:
         """往某个 section 末尾追加一行。
@@ -108,7 +133,9 @@ class MemoryStore:
 
         TODO: read_section → 拼接 → write_section
         """
-        raise NotImplementedError("TODO: append_section")
+        existing = self.read_section(section)
+        appended = f"{existing}\n{line}".strip() if existing else line.strip()
+        self.write_section(section, appended)
 
     def list_sections(self) -> list[str]:
         """列出当前文件里所有 section 名。
@@ -118,7 +145,7 @@ class MemoryStore:
 
         TODO: 正则提取所有 "## name" 标题
         """
-        raise NotImplementedError("TODO: list_sections")
+        return [name for name, _ in self._parse_sections(self.read_all())]
 
     # ---------- 给 core.py 拼 system prompt 用 ----------
 
@@ -133,4 +160,42 @@ class MemoryStore:
 
         TODO: 实现包装
         """
-        raise NotImplementedError("TODO: get_context_block")
+        non_empty_sections = [
+            (name, body.strip())
+            for name, body in self._parse_sections(self.read_all())
+            if body.strip()
+        ]
+        if not non_empty_sections:
+            return ""
+
+        lines = ["# Memory Summary", ""]
+        for name, body in non_empty_sections:
+            lines.append(f"## {name}")
+            lines.append(body)
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _parse_sections(content: str) -> list[tuple[str, str]]:
+        matches = list(re.finditer(r"^##\s+(.+?)\s*$", content, flags=re.MULTILINE))
+        if not matches:
+            return []
+
+        sections: list[tuple[str, str]] = []
+        for index, match in enumerate(matches):
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+            name = match.group(1).strip()
+            body = content[start:end].strip("\n")
+            sections.append((name, body))
+        return sections
+
+    @staticmethod
+    def _render_sections(sections: list[tuple[str, str]]) -> str:
+        lines = ["# MEMORY.md", ""]
+        for name, body in sections:
+            lines.append(f"## {name}")
+            if body:
+                lines.append(body.strip())
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
