@@ -14,8 +14,20 @@
 
 from __future__ import annotations
 
+import json
+import os
+import signal
+import time
 from pathlib import Path
 from typing import Any
+
+import anthropic
+
+from minibot.memory import MemoryStore
+from minibot.mcp_client import MCPClient, MCPServerConfig
+from minibot.scheduler import CronJob, Scheduler
+from minibot.skills import SkillsLoader
+from minibot.tools import ExecTool, ReadFileTool, ToolRegistry, WriteFileTool
 
 
 class MiniBotCore:
@@ -35,131 +47,291 @@ class MiniBotCore:
         model: str = "claude-sonnet-4-5",
         max_iterations: int = 10,
     ) -> None:
-        """初始化核心引擎。
+        self.workspace = workspace
+        self.config = config
+        self.model = model
+        self.max_iterations = max_iterations
 
-        Args:
-            workspace: 工作目录，MEMORY.md / sessions / skills 都基于此路径。
-            config: 已解析的 config.json 字典。
-            anthropic_api_key: Anthropic API Key（建议从 env 读，不要硬编码）。
-            model: Claude 模型 ID。
-            max_iterations: tool_use 循环最大轮数，防死循环。
+        # Anthropic client
+        self._client = anthropic.Anthropic(api_key=anthropic_api_key)
 
-        TODO:
-            - 构造 anthropic.Anthropic 客户端
-            - 实例化 ToolRegistry（注入 allowed_paths / cmd_whitelist）
-            - 实例化 MemoryStore / SkillsLoader / MCPClient / Scheduler
-            - 准备 messages 列表（空，等首条 user 消息进来）
-        """
-        raise NotImplementedError("TODO: __init__")
+        # Tool registry
+        self.tools = ToolRegistry()
+        self._register_tools(config.get("tools", {}), workspace)
+
+        # Memory
+        self.memory = MemoryStore(workspace)
+
+        # Skills — try workspace-relative then config-relative then cwd-relative
+        skills_cfg = config.get("skills", {})
+        skills_dir = self._resolve_path(skills_cfg.get("skills_dir", "./skills"), workspace)
+        self.skills = SkillsLoader(skills_dir)
+
+        # MCP client
+        mcp_servers = [
+            MCPServerConfig(name=name, command=srv["command"], args=srv.get("args", []))
+            for name, srv in config.get("mcp_servers", {}).items()
+        ]
+        self.mcp_client = MCPClient(servers=mcp_servers)
+        if mcp_servers:
+            self.mcp_client.start_all()
+
+        # Scheduler
+        self.scheduler = Scheduler(
+            workspace=workspace,
+            on_trigger=lambda job: self.chat(job.prompt),
+        )
+        for task in config.get("scheduled_tasks", []):
+            self.scheduler.add_job(CronJob(
+                id=task["id"],
+                cron=task["cron"],
+                prompt=task["prompt"],
+                enabled=task.get("enabled", True),
+            ))
+
+        # Multi-turn conversation history
+        self.messages: list[dict[str, Any]] = []
+
+        # AGENTS.md — search workspace parent, then cwd
+        self._agents_md_path = self._find_agents_md(workspace)
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _resolve_path(path_str: str, workspace: Path) -> Path:
+        p = Path(path_str)
+        if p.is_absolute():
+            return p
+        candidate = workspace / p
+        if candidate.exists():
+            return candidate
+        return p  # fall back to cwd-relative; SkillsLoader handles missing dirs
+
+    @staticmethod
+    def _find_agents_md(workspace: Path) -> Path:
+        for candidate in [workspace.parent / "AGENTS.md", Path("AGENTS.md")]:
+            if candidate.exists():
+                return candidate
+        return workspace.parent / "AGENTS.md"
+
+    def _register_tools(self, tools_cfg: dict[str, Any], workspace: Path) -> None:
+        def resolve_paths(raw: list[str]) -> list[Path]:
+            result = []
+            for s in raw:
+                p = Path(s)
+                result.append(p if p.is_absolute() else workspace / p)
+            return result
+
+        exec_cfg = tools_cfg.get("exec", {})
+        if exec_cfg.get("enabled", False):
+            self.tools.register(ExecTool(
+                cmd_whitelist=exec_cfg.get("cmd_whitelist", []),
+                workspace=workspace,
+                timeout_sec=exec_cfg.get("timeout_sec", 30),
+            ))
+
+        read_cfg = tools_cfg.get("read_file", {})
+        if read_cfg.get("enabled", False):
+            self.tools.register(ReadFileTool(
+                allowed_paths=resolve_paths(read_cfg.get("allowed_paths", [])),
+                max_bytes=read_cfg.get("max_bytes", 1_000_000),
+            ))
+
+        write_cfg = tools_cfg.get("write_file", {})
+        if write_cfg.get("enabled", False):
+            self.tools.register(WriteFileTool(
+                allowed_paths=resolve_paths(write_cfg.get("allowed_paths", [])),
+                forbidden_extensions=write_cfg.get("forbidden_extensions"),
+            ))
+
+    # ------------------------------------------------------------------ factory
 
     @classmethod
     def from_config(cls, config_path: str | Path) -> "MiniBotCore":
-        """从 config.json 路径构造实例的便捷方法。
+        """从 config.json 路径构造实例的便捷方法。"""
+        config_path = Path(config_path)
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
 
-        Args:
-            config_path: config.json 文件路径。
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        model = config.get("model", "claude-sonnet-4-5")
+        max_iterations = config.get("max_iterations", 10)
 
-        Returns:
-            初始化好的 MiniBotCore 实例。
+        workspace_str = config.get("workspace", "./workspace")
+        workspace = Path(workspace_str)
+        if not workspace.is_absolute():
+            workspace = config_path.parent / workspace_str
+        workspace.mkdir(parents=True, exist_ok=True)
 
-        TODO:
-            - 用 json.load 读 config
-            - 从 env 读 ANTHROPIC_API_KEY
-            - 调用 __init__
-        """
-        raise NotImplementedError("TODO: from_config")
+        return cls(
+            workspace=workspace,
+            config=config,
+            anthropic_api_key=api_key,
+            model=model,
+            max_iterations=max_iterations,
+        )
 
-    # ---------- system prompt 组装 ----------
+    # ------------------------------------------------------------------ system prompt
 
     def build_system_prompt(self, active_skills: list[str] | None = None) -> str:
         """组装本次请求的 system prompt。
 
-        拼接顺序（对应 Nanobot 的 ContextBuilder）：
-            1. identity（你是 MiniBot ...）
+        拼接顺序：
+            1. identity（config.json 里的 identity 字段）
             2. AGENTS.md（项目级行为指南）
-            3. MEMORY.md（长期记忆摘要）
+            3. MEMORY.md 摘要（长期记忆）
             4. 激活的 skills 的 SKILL.md 全文
-
-        Args:
-            active_skills: 这一轮要挂载的技能名列表；None 表示只挂 always=true 的。
-
-        Returns:
-            最终拼好的 system prompt 字符串。
-
-        TODO: 实现拼接逻辑
         """
-        raise NotImplementedError("TODO: build_system_prompt")
+        parts: list[str] = []
 
-    # ---------- 三种调用入口 ----------
+        # 1. Identity
+        identity = self.config.get("identity", "You are MiniBot, a helpful AI assistant.")
+        parts.append(identity)
+
+        # 2. AGENTS.md
+        if self._agents_md_path.exists():
+            agents_content = self._agents_md_path.read_text(encoding="utf-8").strip()
+            if agents_content:
+                parts.append(agents_content)
+
+        # 3. Memory summary
+        memory_block = self.memory.get_context_block()
+        if memory_block:
+            parts.append(memory_block)
+
+        # 4. Skills (always-skills if not specified)
+        if active_skills is None:
+            active_skills = self.skills.get_always_skills()
+        skills_block = self.skills.build_skills_block(active_skills)
+        if skills_block:
+            parts.append(skills_block)
+
+        return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------ public API
 
     def chat(self, user_message: str) -> str:
-        """单轮对话：发一条消息，跑完 tool_use 循环，返回最终回复。
+        """单轮对话：发一条消息，跑完 tool_use 循环，返回最终回复。"""
+        self.messages.append({"role": "user", "content": user_message})
+        response = self._run_tool_loop()
 
-        Args:
-            user_message: 用户输入。
-
-        Returns:
-            助手的最终文本回复。
-
-        TODO:
-            - 把 user_message 追加到 self.messages
-            - 调用 self._run_tool_loop()
-            - 把最终 assistant 消息文本返回
-        """
-        raise NotImplementedError("TODO: chat")
+        text_parts: list[str] = []
+        for block in response.content:
+            if hasattr(block, "text"):
+                text_parts.append(block.text)
+        return "\n".join(text_parts)
 
     def interactive(self) -> None:
-        """多轮交互式对话（REPL）。
+        """多轮交互式对话（REPL）。"""
+        print("MiniBot ready. Commands: /exit  /clear  /memory")
+        while True:
+            try:
+                user_input = input("\nYou: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting.")
+                break
 
-        在终端循环 input -> chat -> print，直到用户输入 /exit。
+            if not user_input:
+                continue
+            if user_input == "/exit":
+                break
+            if user_input == "/clear":
+                self.messages = []
+                print("Conversation cleared.")
+                continue
+            if user_input == "/memory":
+                print(self.memory.read_all() or "(empty)")
+                continue
 
-        TODO:
-            - while True: 读取输入
-            - 处理 /exit /clear /memory 等元命令
-            - 否则调用 self.chat 并打印结果
-        """
-        raise NotImplementedError("TODO: interactive")
+            try:
+                reply = self.chat(user_input)
+                print(f"\nMiniBot: {reply}")
+            except Exception as exc:
+                print(f"\nError: {exc}")
+
+        self.shutdown()
 
     def start(self) -> None:
-        """守护进程模式：启动 scheduler，等待 cron 任务触发。
+        """守护进程模式：启动 scheduler，等待 cron 任务触发。"""
+        def _handle_signal(signum, frame):
+            print("\nShutting down MiniBot daemon...")
+            self.shutdown()
+            raise SystemExit(0)
 
-        用于「无人值守」场景：定时巡检、定时汇报等。
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+        print("MiniBot daemon started. Waiting for scheduled tasks...")
+        self.scheduler.run_forever()
 
-        TODO:
-            - 启动 self.scheduler.run_forever()
-            - 注册 SIGINT/SIGTERM 信号优雅退出
+    # ------------------------------------------------------------------ tool loop
+
+    def _run_tool_loop(self) -> Any:
+        """tool_use 主循环。
+
+        反复调用 API → 检查 stop_reason → 若为 tool_use 则执行工具并把结果回喂，
+        直到模型返回 end_turn 或达到 max_iterations 上限。
         """
-        raise NotImplementedError("TODO: start")
+        system_prompt = self.build_system_prompt()
+        tool_schemas = self.tools.get_schemas() + self.mcp_client.list_tools()
 
-    # ---------- 内部：tool_use 循环 ----------
+        for _ in range(self.max_iterations):
+            response = self._call_api_with_retry(system_prompt, tool_schemas)
 
-    def _run_tool_loop(self) -> dict[str, Any]:
-        """tool_use 主循环（核心算法）。
+            # Append assistant turn to history
+            self.messages.append({"role": "assistant", "content": response.content})
 
-        伪代码：
-            for i in range(max_iterations):
-                resp = anthropic.messages.create(messages, tools, system)
-                self.messages.append(assistant_block)
-                if resp.stop_reason != "tool_use":
-                    return resp
-                for tc in resp.tool_calls:
-                    result = self.tools.execute(tc.name, tc.input)
-                    self.messages.append(tool_result_block)
-            raise RuntimeError("max_iterations exceeded")
+            if response.stop_reason != "tool_use":
+                return response
 
-        Returns:
-            最终的 LLM 响应（含 stop_reason="end_turn" 的消息）。
+            # Collect and execute all tool calls in this turn
+            tool_results: list[dict[str, Any]] = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                if block.name.startswith("mcp_"):
+                    result = self.mcp_client.call_tool(block.name, block.input)
+                else:
+                    result = self.tools.execute(block.name, block.input)
 
-        TODO: 实现循环 + 工具分发 + tool_result 回喂
-        """
-        raise NotImplementedError("TODO: _run_tool_loop")
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+
+            self.messages.append({"role": "user", "content": tool_results})
+
+        raise RuntimeError(f"tool_use loop exceeded max_iterations={self.max_iterations}")
+
+    def _call_api_with_retry(self, system_prompt: str, tool_schemas: list[dict[str, Any]]) -> Any:
+        """调用 Anthropic API，失败时最多重试 3 次（指数退避）。"""
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                kwargs: dict[str, Any] = {
+                    "model": self.model,
+                    "max_tokens": 4096,
+                    "system": system_prompt,
+                    "messages": self.messages,
+                }
+                if tool_schemas:
+                    kwargs["tools"] = tool_schemas
+                return self._client.messages.create(**kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        raise RuntimeError(f"API call failed after 3 attempts: {last_exc}") from last_exc
+
+    # ------------------------------------------------------------------ shutdown
 
     def shutdown(self) -> None:
-        """关闭所有后台资源（MCP 子进程、scheduler、文件句柄）。
-
-        TODO:
-            - self.mcp_client.close_all()
-            - self.scheduler.stop()
-            - flush 当前 session 到磁盘
-        """
-        raise NotImplementedError("TODO: shutdown")
+        """关闭所有后台资源（MCP 子进程、scheduler）。"""
+        try:
+            self.mcp_client.close_all()
+        except Exception:
+            pass
+        try:
+            self.scheduler.stop()
+        except Exception:
+            pass

@@ -25,8 +25,11 @@ SKILL.md frontmatter 示例：
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 
 class SkillsLoader:
@@ -43,7 +46,9 @@ class SkillsLoader:
             - self._cache: dict[str, dict] = {}  # name -> {meta, body, path}
             - 立即扫描一次（self._scan）
         """
-        raise NotImplementedError("TODO: __init__")
+        self.skills_dir = skills_dir
+        self._cache: dict[str, dict[str, Any]] = {}
+        self._scan()
 
     def _scan(self) -> None:
         """遍历 skills_dir 下所有子目录的 SKILL.md，填充 self._cache。
@@ -52,7 +57,23 @@ class SkillsLoader:
             - for sub in skills_dir.iterdir(): if (sub / "SKILL.md").exists(): parse
             - 解析 frontmatter（yaml.safe_load）和正文
         """
-        raise NotImplementedError("TODO: _scan")
+        self._cache = {}
+        if not self.skills_dir.exists():
+            return
+
+        for sub in sorted(self.skills_dir.iterdir()):
+            skill_md = sub / "SKILL.md"
+            if not sub.is_dir() or not skill_md.exists():
+                continue
+            meta, body = self._parse_skill_md(skill_md)
+            name = str(meta.get("name") or sub.name)
+            self._cache[name] = {
+                "name": name,
+                "description": meta.get("description", ""),
+                "always": bool(meta.get("always", False)),
+                "body": body.strip(),
+                "path": skill_md,
+            }
 
     @staticmethod
     def _parse_skill_md(path: Path) -> tuple[dict[str, Any], str]:
@@ -68,7 +89,16 @@ class SkillsLoader:
             - 用正则 r"^---\\n(.*?)\\n---\\n(.*)$" + DOTALL 匹配
             - yaml.safe_load(frontmatter)
         """
-        raise NotImplementedError("TODO: _parse_skill_md")
+        text = path.read_text(encoding="utf-8")
+        match = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, flags=re.DOTALL)
+        if not match:
+            return {}, text.strip()
+
+        metadata = yaml.safe_load(match.group(1)) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        body = match.group(2).strip()
+        return metadata, body
 
     def list_skills(self) -> list[dict[str, Any]]:
         """返回所有已发现的技能元信息。
@@ -79,7 +109,14 @@ class SkillsLoader:
 
         TODO: 从 self._cache 提取
         """
-        raise NotImplementedError("TODO: list_skills")
+        return [
+            {
+                "name": name,
+                "description": data.get("description", ""),
+                "always": bool(data.get("always", False)),
+            }
+            for name, data in self._cache.items()
+        ]
 
     def get_always_skills(self) -> list[str]:
         """返回所有 always=true 的技能名。
@@ -89,7 +126,7 @@ class SkillsLoader:
 
         TODO: 过滤 self._cache
         """
-        raise NotImplementedError("TODO: get_always_skills")
+        return [name for name, data in self._cache.items() if data.get("always")]
 
     def load_skill_body(self, name: str) -> str:
         """读取指定技能的正文（不含 frontmatter）。
@@ -102,7 +139,7 @@ class SkillsLoader:
 
         TODO: self._cache[name]["body"]
         """
-        raise NotImplementedError("TODO: load_skill_body")
+        return str(self._cache.get(name, {}).get("body", ""))
 
     def build_skills_block(self, active_skills: list[str]) -> str:
         """把若干技能正文拼成一段可嵌入 system prompt 的文本。
@@ -116,4 +153,17 @@ class SkillsLoader:
 
         TODO: 实现拼接，跳过不存在的 skill
         """
-        raise NotImplementedError("TODO: build_skills_block")
+        seen: set[str] = set()
+        sections: list[str] = []
+        for name in active_skills:
+            if name in seen:
+                continue
+            seen.add(name)
+            body = self.load_skill_body(name).strip()
+            if not body:
+                continue
+            sections.append(f"## {name}\n{body}")
+
+        if not sections:
+            return ""
+        return "# Skills\n\n" + "\n\n".join(sections)
