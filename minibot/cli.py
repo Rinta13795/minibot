@@ -13,79 +13,98 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+from minibot.core import MiniBotCore
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """构造命令行解析器。
+    """构造命令行解析器，含 chat / interactive / start 三个子命令。"""
+    parser = argparse.ArgumentParser(
+        prog="minibot",
+        description="MiniBot — 轻量级 AI Agent 框架（学习项目）",
+    )
+    parser.add_argument(
+        "--config",
+        default="config.json",
+        help="config.json 路径（默认 ./config.json）",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-    Returns:
-        配置好的 ArgumentParser，支持 chat / interactive / start 三个子命令。
+    chat_p = sub.add_parser("chat", help="单轮问答")
+    chat_p.add_argument("message", help="用户消息")
 
-    TODO:
-        - parser = ArgumentParser("minibot")
-        - parser.add_argument("--config", default="config.json")
-        - sub = parser.add_subparsers(dest="cmd", required=True)
-        - chat_p = sub.add_parser("chat"); chat_p.add_argument("message")
-        - sub.add_parser("interactive")
-        - sub.add_parser("start")
-    """
-    raise NotImplementedError("TODO: build_parser")
+    sub.add_parser("interactive", help="进入 REPL")
+    sub.add_parser("start", help="守护进程模式（含 scheduler）")
+
+    return parser
 
 
 def cmd_chat(config_path: Path, message: str) -> int:
-    """处理 `minibot chat` 子命令。
-
-    Args:
-        config_path: config.json 路径。
-        message: 用户消息。
-
-    Returns:
-        exit code：0 成功，非 0 失败。
-
-    TODO:
-        - core = MiniBotCore.from_config(config_path)
-        - print(core.chat(message))
-        - core.shutdown()
-        - 异常时打印错误并返回 1
-    """
-    raise NotImplementedError("TODO: cmd_chat")
+    """处理 `minibot chat` 子命令：单轮问答后退出。"""
+    core: MiniBotCore | None = None
+    try:
+        core = MiniBotCore.from_config(config_path)
+        reply = core.chat(message)
+        print(reply)
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if core is not None:
+            core.shutdown()
 
 
 def cmd_interactive(config_path: Path) -> int:
-    """处理 `minibot interactive` 子命令。
-
-    TODO:
-        - core = MiniBotCore.from_config(config_path)
-        - core.interactive()
-        - core.shutdown()
-    """
-    raise NotImplementedError("TODO: cmd_interactive")
+    """处理 `minibot interactive` 子命令：REPL 多轮对话。"""
+    core: MiniBotCore | None = None
+    try:
+        core = MiniBotCore.from_config(config_path)
+        core.interactive()
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if core is not None:
+            core.shutdown()
 
 
 def cmd_start(config_path: Path) -> int:
-    """处理 `minibot start` 子命令（守护进程模式）。
-
-    TODO:
-        - core = MiniBotCore.from_config(config_path)
-        - core.start()  # 阻塞，直到 Ctrl+C
-        - core.shutdown()
-    """
-    raise NotImplementedError("TODO: cmd_start")
+    """处理 `minibot start` 子命令：守护进程，阻塞等待 cron 触发。"""
+    core: MiniBotCore | None = None
+    try:
+        core = MiniBotCore.from_config(config_path)
+        core.start()
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if core is not None:
+            core.shutdown()
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI 总入口。
+    """CLI 总入口。根据子命令派发到对应处理函数。"""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    config_path = Path(args.config)
 
-    Args:
-        argv: 命令行参数列表；None 表示用 sys.argv。
+    if args.cmd == "chat":
+        return cmd_chat(config_path, args.message)
+    if args.cmd == "interactive":
+        return cmd_interactive(config_path)
+    if args.cmd == "start":
+        return cmd_start(config_path)
 
-    Returns:
-        进程 exit code。
+    parser.print_help()
+    return 2
 
-    TODO:
-        - parser = build_parser()
-        - args = parser.parse_args(argv)
-        - 根据 args.cmd 派发到 cmd_chat / cmd_interactive / cmd_start
-    """
-    raise NotImplementedError("TODO: main")
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

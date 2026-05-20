@@ -227,8 +227,16 @@ class MiniBotCore:
         return "\n".join(text_parts)
 
     def interactive(self) -> None:
-        """多轮交互式对话（REPL）。"""
-        print("MiniBot ready. Commands: /exit  /clear  /memory")
+        """多轮交互式对话（REPL）。
+
+        元命令：
+            /quit, /exit   退出
+            /clear         清空对话历史
+            /memory        打印 MEMORY.md
+            /skills        列出已加载的技能（包含 always 标记）
+            /help          打印帮助
+        """
+        print("MiniBot ready. Commands: /quit  /clear  /memory  /skills  /help")
         while True:
             try:
                 user_input = input("\nYou: ").strip()
@@ -238,7 +246,7 @@ class MiniBotCore:
 
             if not user_input:
                 continue
-            if user_input == "/exit":
+            if user_input in ("/quit", "/exit"):
                 break
             if user_input == "/clear":
                 self.messages = []
@@ -247,14 +255,24 @@ class MiniBotCore:
             if user_input == "/memory":
                 print(self.memory.read_all() or "(empty)")
                 continue
+            if user_input == "/skills":
+                skills = self.skills.list_skills()
+                if not skills:
+                    print("(no skills loaded)")
+                else:
+                    for s in skills:
+                        mark = "[always]" if s.get("always") else "        "
+                        print(f"  {mark} {s['name']:<20} {s.get('description', '')}")
+                continue
+            if user_input == "/help":
+                print("Commands: /quit  /clear  /memory  /skills  /help")
+                continue
 
             try:
                 reply = self.chat(user_input)
                 print(f"\nMiniBot: {reply}")
             except Exception as exc:
                 print(f"\nError: {exc}")
-
-        self.shutdown()
 
     def start(self) -> None:
         """守护进程模式：启动 scheduler，等待 cron 任务触发。"""
