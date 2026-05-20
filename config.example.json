@@ -1,0 +1,38 @@
+{
+  "workspace": "./workspace",
+  "model": "claude-sonnet-4-5",
+  "max_iterations": 10,
+
+  "identity": "你是 MiniBot，一个谨慎、礼貌、擅长查文档的助手。",
+
+  "tools": {
+    "exec": {
+      "enabled": true,
+      "cmd_whitelist": ["ls", "cat", "grep", "find", "python3", "git"],
+      "timeout_sec": 30
+    },
+    "read_file": {
+      "enabled": true,
+      "allowed_paths": ["./workspace", "./docs"],
+      "max_bytes": 1000000
+    },
+    "write_file": {
+      "enabled": true,
+      "allowed_paths": ["./workspace"],
+      "forbidden_extensions": [".sh", ".py", ".exe"]
+    }
+  },
+
+  "skills": {
+    "skills_dir": "./skills",
+    "disabled": []
+  },
+
+  "memory": {
+    "memory_file": "./workspace/MEMORY.md"
+  },
+
+  "mcp_servers": {},
+
+  "scheduled_tasks": []
+}
