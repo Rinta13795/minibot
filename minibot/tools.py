@@ -375,10 +375,19 @@ class WriteFileTool(Tool):
 
         target_resolved.parent.mkdir(parents=True, exist_ok=True)
 
+        # 拒绝写入 symlink：shutil.copy2 会跟随 symlink 把外部文件内容复制到备份，
+        # 即使 os.replace 最终替换的是 symlink 本身而非外部文件，备份已造成泄漏。
+        if target_resolved.is_symlink():
+            return "Error: refusing to write through symlink"
+
         # 备份原文件
         backup_path: Path | None = None
         if self.make_backup and target_resolved.exists():
             backup_path = target_resolved.with_suffix(target_resolved.suffix + ".bak")
+            # 备份目标本身也可能是 symlink（指向 allowed_paths 外），
+            # shutil.copy2 会跟随它写入外部文件，须同样拒绝。
+            if backup_path.is_symlink():
+                return "Error: refusing to overwrite symlink at backup path"
             try:
                 shutil.copy2(target_resolved, backup_path)
             except Exception as exc:
