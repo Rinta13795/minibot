@@ -29,7 +29,7 @@ import os
 import re
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -114,17 +114,31 @@ class MemoryStore:
     def _write_legacy_backup_and_warn(
         self, content: str, demoted: list[str]
     ) -> None:
-        """把原文件备份到 MEMORY.md.legacy-backup 并发 warning。
+        """把原文件备份到带 UTC 时间戳的 MEMORY.md.legacy-backup.<TS> 并发 warning。
 
-        备份是 best-effort：写失败不能阻止 MemoryStore 启动，但要继续
-        发出 warning 让用户察觉。
+        备份必须**永不覆盖**——legacy migration 可能在不同时间点被
+        多次触发（用户外部删了元数据、外部工具改写文件等），每次的
+        原始状态都不同，覆盖会让早先的迁移损失永远查不回来。带时间戳
+        的文件名既保证唯一也保留完整历史。
+
+        极端情况下同一秒触发两次：附加微秒部分保证唯一。
+
+        备份是 best-effort：写失败不阻止 MemoryStore 启动，但 warning
+        必发，让用户能察觉。
         """
+        now = datetime.now(timezone.utc)
+        # 主时间戳精确到秒；附加 microseconds 防同秒并发碰撞
+        ts = now.strftime("%Y%m%dT%H%M%SZ")
         backup_path = self.memory_path.with_name(
-            self.memory_path.name + ".legacy-backup"
+            f"{self.memory_path.name}.legacy-backup.{ts}"
         )
+        # 极小概率同秒重复（如 fcntl 串行化下多个 init 紧挨着触发）—— 加 us
+        if backup_path.exists():
+            backup_path = self.memory_path.with_name(
+                f"{self.memory_path.name}.legacy-backup.{ts}.{now.microsecond:06d}"
+            )
         try:
-            if not backup_path.exists():
-                backup_path.write_text(content, encoding="utf-8")
+            backup_path.write_text(content, encoding="utf-8")
             backup_note = f"backup at {backup_path.name}"
         except Exception as exc:
             backup_note = f"backup FAILED ({exc})"

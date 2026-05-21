@@ -205,7 +205,7 @@ class TestMemoryStore:
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
         """Legacy 文件含非默认 section 时，迁移必须：
-          - 落盘备份原文件到 MEMORY.md.legacy-backup
+          - 落盘备份原文件到 MEMORY.md.legacy-backup.<时间戳>
           - 通过 stderr 发出 warning，列出被降级的 section 名
         这样 user 才能察觉、对照备份决定是否手动恢复。"""
         memory_path = tmp_path / "MEMORY.md"
@@ -215,11 +215,12 @@ class TestMemoryStore:
         )
         MemoryStore(workspace=tmp_path)
 
-        backup = tmp_path / "MEMORY.md.legacy-backup"
-        assert backup.exists(), "must create backup of legacy file"
+        backups = list(tmp_path.glob("MEMORY.md.legacy-backup.*"))
+        assert len(backups) == 1, "must create exactly one timestamped backup"
         # 备份内容 == 原始 legacy 文件
-        assert "## zeta" in backup.read_text(encoding="utf-8")
-        assert "z" in backup.read_text(encoding="utf-8")
+        body = backups[0].read_text(encoding="utf-8")
+        assert "## zeta" in body
+        assert "z" in body
 
         captured = capsys.readouterr()
         assert "zeta" in captured.err
@@ -236,9 +237,46 @@ class TestMemoryStore:
         )
         MemoryStore(workspace=tmp_path)
 
-        backup = tmp_path / "MEMORY.md.legacy-backup"
-        assert not backup.exists()
+        backups = list(tmp_path.glob("MEMORY.md.legacy-backup*"))
+        assert backups == []
         assert capsys.readouterr().err == ""
+
+    def test_second_legacy_migration_preserves_prior_backup(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """如果 legacy migration 在不同时间点触发两次（例如用户外部
+        删除了元数据后又编辑文件），两次的原始状态都必须保留。
+        覆盖旧 backup 会让前一次的迁移损失永远查不回来。"""
+        memory_path = tmp_path / "MEMORY.md"
+
+        # 第一次迁移：state #1
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nv1\n\n## zeta\nold-z\n",
+            encoding="utf-8",
+        )
+        MemoryStore(workspace=tmp_path)
+        capsys.readouterr()  # discard
+
+        # 用户手动删元数据 + 改文件，状态变为 state #2
+        # 为了让时间戳错开，stub 一下时间
+        import time as _time
+        _time.sleep(1.1)  # 让 strftime 拿到不同的秒
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nv2\n\n## omega\nnew-o\n",
+            encoding="utf-8",
+        )
+        MemoryStore(workspace=tmp_path)
+
+        backups = sorted(tmp_path.glob("MEMORY.md.legacy-backup.*"))
+        assert len(backups) == 2, (
+            f"two distinct migrations must produce two backups, got: "
+            f"{[b.name for b in backups]}"
+        )
+        bodies = [b.read_text(encoding="utf-8") for b in backups]
+        # 早的备份含 zeta/old-z；新的备份含 omega/new-o
+        all_text = "\n".join(bodies)
+        assert "old-z" in all_text
+        assert "new-o" in all_text
 
     def test_legacy_file_migration_writes_metadata_with_defaults_only(
         self, tmp_path: Path
