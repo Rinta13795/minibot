@@ -384,6 +384,10 @@ class WriteFileTool(Tool):
         backup_path: Path | None = None
         if self.make_backup and target_resolved.exists():
             backup_path = target_resolved.with_suffix(target_resolved.suffix + ".bak")
+            # 备份目标本身也可能是 symlink（指向 allowed_paths 外），
+            # shutil.copy2 会跟随它写入外部文件，须同样拒绝。
+            if backup_path.is_symlink():
+                return "Error: refusing to overwrite symlink at backup path"
             try:
                 shutil.copy2(target_resolved, backup_path)
             except Exception as exc:
