@@ -140,6 +140,7 @@ class MiniBotCore:
             self.tools.register(ReadFileTool(
                 allowed_paths=resolve_paths(read_cfg.get("allowed_paths", [])),
                 max_bytes=read_cfg.get("max_bytes", 1_000_000),
+                allow_broad_paths=read_cfg.get("allow_broad_paths", False),
             ))
 
         write_cfg = tools_cfg.get("write_file", {})
@@ -147,6 +148,7 @@ class MiniBotCore:
             self.tools.register(WriteFileTool(
                 allowed_paths=resolve_paths(write_cfg.get("allowed_paths", [])),
                 forbidden_extensions=write_cfg.get("forbidden_extensions"),
+                allow_broad_paths=write_cfg.get("allow_broad_paths", False),
             ))
 
     # ------------------------------------------------------------------ factory
