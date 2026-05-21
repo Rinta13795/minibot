@@ -201,6 +201,45 @@ class TestMemoryStore:
         assert "晚安风格" not in store2.list_sections()
         assert store2.read_section("user") == body
 
+    def test_legacy_file_creates_backup_and_warns_on_demotion(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Legacy 文件含非默认 section 时，迁移必须：
+          - 落盘备份原文件到 MEMORY.md.legacy-backup
+          - 通过 stderr 发出 warning，列出被降级的 section 名
+        这样 user 才能察觉、对照备份决定是否手动恢复。"""
+        memory_path = tmp_path / "MEMORY.md"
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nalice\n\n## zeta\nz\n",
+            encoding="utf-8",
+        )
+        MemoryStore(workspace=tmp_path)
+
+        backup = tmp_path / "MEMORY.md.legacy-backup"
+        assert backup.exists(), "must create backup of legacy file"
+        # 备份内容 == 原始 legacy 文件
+        assert "## zeta" in backup.read_text(encoding="utf-8")
+        assert "z" in backup.read_text(encoding="utf-8")
+
+        captured = capsys.readouterr()
+        assert "zeta" in captured.err
+        assert "legacy" in captured.err.lower() or "demoting" in captured.err.lower()
+
+    def test_legacy_file_pure_defaults_no_backup_no_warn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """纯默认 section 的 legacy 文件迁移不应触发 backup / warning。"""
+        memory_path = tmp_path / "MEMORY.md"
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nalice\n\n## project\np\n",
+            encoding="utf-8",
+        )
+        MemoryStore(workspace=tmp_path)
+
+        backup = tmp_path / "MEMORY.md.legacy-backup"
+        assert not backup.exists()
+        assert capsys.readouterr().err == ""
+
     def test_legacy_file_migration_writes_metadata_with_defaults_only(
         self, tmp_path: Path
     ) -> None:

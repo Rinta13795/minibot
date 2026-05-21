@@ -24,6 +24,7 @@ Windows 退化为 threading.Lock。
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import sys
@@ -31,6 +32,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
+
+_log = logging.getLogger(__name__)
 
 # fcntl 仅在 POSIX 可用；Windows 退化为线程锁
 try:
@@ -80,24 +83,62 @@ class MemoryStore:
         write_section / append_entry 显式创建的 section 名。不会被
         body 里的 Markdown 二级标题污染。
 
-        如果文件没有元数据（旧 MEMORY.md / 外部手编辑），做**保守**
-        一次性迁移：仅信任 DEFAULT_SECTIONS，不扫描其他 ## X 加入
-        白名单。这避免了 pre-fix bug 把 body-injected `## 早安风格`
-        当成 orphan section 落盘的场景在迁移时被错误地"承认"，让 bug
-        在新代码下继续成立。
+        没有元数据时（旧 MEMORY.md / 外部手编辑），有两个互斥的失败模式：
+          1. 扫描所有 ## X 加入白名单 → pre-fix bug 制造的 body-injected
+             subheading 被错误"扶正"为合法 section，bug 复现。
+          2. 只信任 DEFAULT_SECTIONS → 用户合法的自定义 section（如 zeta）
+             会静默并入前一个默认 section 的 body。
 
-        代价：旧文件里通过 write_section 显式建过的自定义 section
-        （如 "zeta"）首次打开后会变成上一个默认 section 的 body。
-        若需保留自定义 section，应手动在元数据注释里补上名字。
+        权衡：选 (2) 杜绝 bug 复发，但**必须显式告知用户**——
+          - 落盘备份原文件到 MEMORY.md.legacy-backup
+          - 通过 logging.warning 列出被降级的 section 名
+          - 用户可对照备份决定是否在元数据注释里手动恢复 section
         """
         content = self.memory_path.read_text(encoding="utf-8")
         if self._read_metadata_into_known_sections(content):
             return
-        # 旧文件：不扫描 ## X 加入白名单（防止 body 注入被错误"扶正"）。
-        # 直接用 DEFAULT_SECTIONS 解析并写回新格式，此后任何新 ## 标题
-        # 都被视为 body 内容，除非通过 write_section 显式添加。
+
+        # 扫描非默认 header 并告警 + 备份
+        non_default_headers = sorted({
+            m.group(1).strip()
+            for m in re.finditer(r"^##\s+(.+?)\s*$", content, flags=re.MULTILINE)
+            if m.group(1).strip() not in self.DEFAULT_SECTIONS
+        })
+        if non_default_headers:
+            self._write_legacy_backup_and_warn(content, non_default_headers)
+
+        # 保守解析（默认白名单）后立即写回新格式
         sections = self._parse_sections(content)
         self.write_all(self._render_sections(sections))
+
+    def _write_legacy_backup_and_warn(
+        self, content: str, demoted: list[str]
+    ) -> None:
+        """把原文件备份到 MEMORY.md.legacy-backup 并发 warning。
+
+        备份是 best-effort：写失败不能阻止 MemoryStore 启动，但要继续
+        发出 warning 让用户察觉。
+        """
+        backup_path = self.memory_path.with_name(
+            self.memory_path.name + ".legacy-backup"
+        )
+        try:
+            if not backup_path.exists():
+                backup_path.write_text(content, encoding="utf-8")
+            backup_note = f"backup at {backup_path.name}"
+        except Exception as exc:
+            backup_note = f"backup FAILED ({exc})"
+
+        msg = (
+            "Legacy MEMORY.md detected (no minibot-sections metadata). "
+            f"Demoting non-default headers to body content: {demoted}. "
+            f"{backup_note}. If any of these were legitimate custom sections, "
+            "restore them by adding their names to the "
+            f"'{self._SECTIONS_META_PREFIX.strip()}' metadata line."
+        )
+        _log.warning(msg)
+        # 同时打到 stderr — logging 在没人配 handler 时可能不可见
+        sys.stderr.write(f"[minibot.memory] {msg}\n")
 
     def _read_metadata_into_known_sections(self, content: str) -> bool:
         """从文件内容里找元数据行；找到则把名字加入 _known_sections，返回 True。"""
