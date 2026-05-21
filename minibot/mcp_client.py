@@ -50,6 +50,12 @@ class MCPClient:
         self._servers = servers
         self._processes: dict[str, subprocess.Popen] = {}
         self._tool_cache: dict[str, list[dict[str, Any]]] = {}
+        # 公共工具名 → (server_name, tool_name) 路由表。
+        # 启动时一次性建好，call_tool 查表而不是反向解析字符串：
+        # 因为 server 名和 tool 名都可能含下划线，"mcp_file_server_read" 既
+        # 可能是 server=file / tool=server_read，也可能是 server=file_server /
+        # tool=read，反向解析无法区分。
+        self._tool_routes: dict[str, tuple[str, str]] = {}
         self._request_id = 0
         self.timeout_sec = timeout_sec
         self.max_line_bytes = max_line_bytes
@@ -79,7 +85,12 @@ class MCPClient:
                 })
                 # 拉取工具列表并缓存
                 result = self._send_request(srv.name, "tools/list", {})
-                self._tool_cache[srv.name] = result.get("tools", [])
+                tools = result.get("tools", [])
+                self._tool_cache[srv.name] = tools
+                # 同步登记路由表，保证 list_tools / call_tool 视图一致
+                for tool in tools:
+                    public_name = f"mcp_{srv.name}_{tool['name']}"
+                    self._tool_routes[public_name] = (srv.name, tool["name"])
             except Exception:
                 # 启动握手失败 — 干掉这个进程并冒泡
                 try:
@@ -111,6 +122,7 @@ class MCPClient:
                 pass
         self._processes = {}
         self._tool_cache = {}
+        self._tool_routes = {}
 
     # ---------- JSON-RPC ----------
 
@@ -237,12 +249,12 @@ class MCPClient:
 
     def call_tool(self, prefixed_name: str, arguments: dict[str, Any]) -> str:
         """调用一个 MCP 工具，返回字符串结果。"""
-        parts = prefixed_name.split("_", 2)
-        if len(parts) < 3 or parts[0] != "mcp":
+        # 查路由表而非字符串反向解析——server / tool 名含下划线时反向解析
+        # 会把 "mcp_file_server_read" 错切成 server=file / tool=server_read。
+        route = self._tool_routes.get(prefixed_name)
+        if route is None:
             return f"Error: invalid MCP tool name '{prefixed_name}'"
-
-        server_name = parts[1]
-        tool_name = parts[2]
+        server_name, tool_name = route
 
         try:
             result = self._send_request(server_name, "tools/call", {
