@@ -152,3 +152,71 @@ time.sleep(10)
         client.start_all()
         client.close_all()
         client.close_all()  # 第二次不应抛
+
+    def test_underscore_server_name_routes_correctly(self, tmp_path: Path) -> None:
+        """server 名 file_server + tool 名 read_file 的组合在反向 split 下
+        无法区分 server="file" / tool="server_read_file"，必须靠路由表。"""
+        path = _make_server(tmp_path, GOOD_SERVER)
+        # 让 server 名也带下划线
+        client = MCPClient([
+            MCPServerConfig(name="file_server", command=sys.executable, args=[str(path)])
+        ])
+        try:
+            client.start_all()
+            schemas = client.list_tools()
+            # 公共名应该是 mcp_file_server_echo
+            assert any(s["name"] == "mcp_file_server_echo" for s in schemas)
+            # 调用必须走到 (server=file_server, tool=echo)，而不是
+            # (server=file, tool=server_echo)
+            result = client.call_tool("mcp_file_server_echo", {"text": "ok"})
+            assert result == "echo:ok"
+        finally:
+            client.close_all()
+
+    def test_underscore_tool_name_routes_correctly(self, tmp_path: Path) -> None:
+        """tool 名 read_file 也含下划线——验证完整名分隔不依赖 tool 名结构。"""
+        body = """
+import json, sys
+
+def respond(req, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": result}) + "\\n")
+    sys.stdout.flush()
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    if req["method"] == "initialize":
+        respond(req, {"protocolVersion": "2024-11-05"})
+    elif req["method"] == "tools/list":
+        respond(req, {"tools": [{"name": "read_file", "description": "rf", "inputSchema": {"type": "object"}}]})
+    elif req["method"] == "tools/call":
+        respond(req, {"content": [{"type": "text", "text": "TOOL=" + req["params"]["name"]}]})
+"""
+        path = _make_server(tmp_path, body)
+        client = MCPClient([
+            MCPServerConfig(name="fs", command=sys.executable, args=[str(path)])
+        ])
+        try:
+            client.start_all()
+            # 公共名 mcp_fs_read_file。Server 必须收到 name="read_file"，
+            # 而不是 name="file"（旧 split("_", 2) 会得到 tool=read_file 正确，
+            # 但如果 server="f" / tool="s_read_file" 之类的边角情况就会出错）。
+            result = client.call_tool("mcp_fs_read_file", {})
+            assert result == "TOOL=read_file"
+        finally:
+            client.close_all()
+
+    def test_unknown_tool_name_returns_error(self, tmp_path: Path) -> None:
+        """未注册的 mcp_* 名字应返回 Error 而不是穿透到 _send_request。"""
+        path = _make_server(tmp_path, GOOD_SERVER)
+        client = MCPClient([MCPServerConfig(name="srv", command=sys.executable, args=[str(path)])])
+        try:
+            client.start_all()
+            result = client.call_tool("mcp_srv_nonexistent_tool", {})
+            assert result.startswith("Error")
+            # 也应拦截完全恶意的名字
+            assert client.call_tool("not_mcp_at_all", {}).startswith("Error")
+        finally:
+            client.close_all()
