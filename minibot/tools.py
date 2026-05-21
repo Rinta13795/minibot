@@ -375,6 +375,11 @@ class WriteFileTool(Tool):
 
         target_resolved.parent.mkdir(parents=True, exist_ok=True)
 
+        # 拒绝写入 symlink：shutil.copy2 会跟随 symlink 把外部文件内容复制到备份，
+        # 即使 os.replace 最终替换的是 symlink 本身而非外部文件，备份已造成泄漏。
+        if target_resolved.is_symlink():
+            return "Error: refusing to write through symlink"
+
         # 备份原文件
         backup_path: Path | None = None
         if self.make_backup and target_resolved.exists():

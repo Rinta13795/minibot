@@ -91,6 +91,22 @@ class TestWriteFileTool:
         assert result.startswith("Error")
         assert not (tmp_path / "evil.sh").exists()
 
+    def test_blocks_symlink_write_prevents_leak(self, tmp_path: Path) -> None:
+        # symlink 指向 allowed_paths 外的敏感文件
+        external = tmp_path.parent / "secret.txt"
+        external.write_text("sensitive-data", encoding="utf-8")
+        link = tmp_path / "link.txt"
+        link.symlink_to(external)
+
+        tool = WriteFileTool(allowed_paths=[tmp_path])
+        result = tool.execute(path=str(link), content="overwrite")
+
+        assert result.startswith("Error")
+        # 外部文件内容不应被复制到 allowed 目录下的备份
+        assert not (tmp_path / "link.txt.bak").exists()
+        # 外部文件未被修改
+        assert external.read_text() == "sensitive-data"
+
 
 # ============================================================
 # ToolRegistry
