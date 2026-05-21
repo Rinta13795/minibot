@@ -48,6 +48,7 @@ class MiniBotCore:
         max_iterations: int = 10,
         max_history_messages: int = 40,
         max_tool_result_chars: int = 20_000,
+        max_aggregate_tool_result_chars: int = 80_000,
     ) -> None:
         self.workspace = workspace
         self.config = config
@@ -62,6 +63,12 @@ class MiniBotCore:
         # window。ReadFileTool 内部已有 max_bytes，但 ExecTool stdout 和
         # MCP call_tool 结果不受限。在这里统一截断作为最后一道兜底。
         self.max_tool_result_chars = max_tool_result_chars
+        # 单次 assistant 转响里**所有** tool_result 字符总和的上限。
+        # 模型一次可以发起多个 tool_use 块，全部 tool_result 进同一条
+        # user message——单条 cap 限不住聚合（N × per_cap 仍可任意大）。
+        # 注：tool_use_id 必须 1:1 对应 tool_result，不能跳过；超额时只能
+        # 把每个 result 进一步截到 cap / N。
+        self.max_aggregate_tool_result_chars = max_aggregate_tool_result_chars
 
         # Anthropic client
         self._client = anthropic.Anthropic(api_key=anthropic_api_key)
@@ -174,6 +181,9 @@ class MiniBotCore:
         max_iterations = config.get("max_iterations", 10)
         max_history_messages = config.get("max_history_messages", 40)
         max_tool_result_chars = config.get("max_tool_result_chars", 20_000)
+        max_aggregate_tool_result_chars = config.get(
+            "max_aggregate_tool_result_chars", 80_000
+        )
 
         workspace_str = config.get("workspace", "./workspace")
         workspace = Path(workspace_str)
@@ -189,6 +199,7 @@ class MiniBotCore:
             max_iterations=max_iterations,
             max_history_messages=max_history_messages,
             max_tool_result_chars=max_tool_result_chars,
+            max_aggregate_tool_result_chars=max_aggregate_tool_result_chars,
         )
 
     # ------------------------------------------------------------------ system prompt
@@ -344,39 +355,72 @@ class MiniBotCore:
                     "content": result,
                 })
 
+            # 再施加 aggregate cap：单条 cap 不够防 N × per_cap 聚合爆量。
+            tool_results = self._enforce_aggregate_cap(tool_results)
             self.messages.append({"role": "user", "content": tool_results})
 
         raise RuntimeError(f"tool_use loop exceeded max_iterations={self.max_iterations}")
 
-    def _truncate_tool_result(self, result: str) -> str:
-        """单条工具结果超过 max_tool_result_chars 时截断，保留头尾两端。
+    def _truncate_text(self, text: str, cap: int) -> str:
+        """把 text 截到 cap 字符以内，保留头尾两端 + 省略提示。
 
-        Anthropic API 单条 tool_result 占用的 token 直接计入 context window；
-        滑动窗口 _compact_messages 只控制消息数，无法防范一条 16MB 的 MCP
-        响应或巨型 exec stdout 独自撑爆 context。
-
-        保留头尾两端是因为大输出通常关键信息分布在开头和末尾（错误堆栈
-        在前、退出状态在尾），中间是重复 / 进度日志，截掉对模型推理影响
-        最小。
+        保留头尾两端是因为大输出关键信息通常分布在两端（错误堆栈 /
+        启动横幅在前，退出状态 / 总结在尾），中间多为重复进度日志，
+        截掉对模型推理影响最小。头 3 : 尾 1，留 200 字符给省略提示。
         """
-        if not isinstance(result, str):
-            return result
-        cap = self.max_tool_result_chars
-        if cap <= 0 or len(result) <= cap:
-            return result
-        # 头尾各保留一半，留 200 字符给省略提示
+        if not isinstance(text, str) or cap <= 0 or len(text) <= cap:
+            return text
         budget = max(cap - 200, cap // 2)
         head_len = budget * 3 // 4
         tail_len = budget - head_len
-        head = result[:head_len]
-        tail = result[-tail_len:] if tail_len > 0 else ""
-        omitted = len(result) - head_len - tail_len
+        head = text[:head_len]
+        tail = text[-tail_len:] if tail_len > 0 else ""
+        omitted = len(text) - head_len - tail_len
         return (
             f"{head}\n"
-            f"\n[... truncated {omitted} characters; original {len(result)} chars, "
+            f"\n[... truncated {omitted} characters; original {len(text)} chars, "
             f"cap {cap} ...]\n\n"
             f"{tail}"
         )
+
+    def _truncate_tool_result(self, result: str) -> str:
+        """单条工具结果超过 max_tool_result_chars 时截断。"""
+        return self._truncate_text(result, self.max_tool_result_chars)
+
+    def _enforce_aggregate_cap(
+        self, tool_results: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """一次 turn 内全部 tool_result 聚合不超过 max_aggregate_tool_result_chars。
+
+        模型可以在同一个 assistant 回复里发出多个 tool_use 块，所有
+        tool_result 块进同一条 user message——单条 cap 限不住聚合
+        （N × per_cap 仍可任意大）。
+
+        关键约束：tool_use_id 与 tool_result 必须 1:1 配对（少了 API 400），
+        所以永远不能跳过任何 tool_result，只能进一步截短到 cap / N 的
+        per-result 预算。下限 200 字符，避免极端 N 时结果近乎为空。
+        """
+        cap = self.max_aggregate_tool_result_chars
+        if cap <= 0 or not tool_results:
+            return tool_results
+
+        def _content_len(r: dict[str, Any]) -> int:
+            c = r.get("content")
+            return len(c) if isinstance(c, str) else 0
+
+        total = sum(_content_len(r) for r in tool_results)
+        if total <= cap:
+            return tool_results
+
+        n = len(tool_results)
+        per_budget = max(cap // n, 200)
+        adjusted: list[dict[str, Any]] = []
+        for r in tool_results:
+            content = r.get("content")
+            if isinstance(content, str) and len(content) > per_budget:
+                content = self._truncate_text(content, per_budget)
+            adjusted.append({**r, "content": content})
+        return adjusted
 
     def _compact_messages(self) -> None:
         """滑动窗口截断：当 messages 超过 max_history_messages 时丢弃旧消息。

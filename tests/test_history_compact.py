@@ -186,6 +186,56 @@ def test_tool_result_over_cap_truncated_with_marker(core: MiniBotCore) -> None:
     assert "MIDDLE_MARKER" not in out
 
 
+def test_aggregate_cap_no_op_when_under_limit(core: MiniBotCore) -> None:
+    core.max_aggregate_tool_result_chars = 10_000
+    results = [
+        {"type": "tool_result", "tool_use_id": "a", "content": "x" * 1000},
+        {"type": "tool_result", "tool_use_id": "b", "content": "y" * 1000},
+    ]
+    out = core._enforce_aggregate_cap(results)
+    assert out == results  # 完全不变
+
+
+def test_aggregate_cap_shrinks_each_result_when_over_limit(
+    core: MiniBotCore,
+) -> None:
+    """10 个工具各返回 20K 字符 = 200K 聚合，超过 80K aggregate cap
+    必须把每个 result 进一步截到 ~cap / N = 8K 内。"""
+    core.max_aggregate_tool_result_chars = 80_000
+    core.max_tool_result_chars = 20_000  # 单条 cap 限不住聚合
+    results = [
+        {"type": "tool_result", "tool_use_id": f"id-{i}", "content": "X" * 20_000}
+        for i in range(10)
+    ]
+    out = core._enforce_aggregate_cap(results)
+    # 每条 tool_use_id 都必须仍有对应 tool_result（API 1:1 约束）
+    assert len(out) == 10
+    assert [r["tool_use_id"] for r in out] == [r["tool_use_id"] for r in results]
+    # 聚合大小应在 cap 附近（含每条的省略提示开销）
+    total = sum(len(r["content"]) for r in out)
+    assert total <= core.max_aggregate_tool_result_chars * 2  # 含 marker 开销
+    # 每条都应被截短
+    for r in out:
+        assert len(r["content"]) < 20_000
+        assert "truncated" in r["content"].lower()
+
+
+def test_aggregate_cap_preserves_minimum_per_result(core: MiniBotCore) -> None:
+    """N 极大时 cap / N 会非常小；下限 200 字符保证每个 tool_use_id
+    至少有可读响应，不会被压成空串。"""
+    core.max_aggregate_tool_result_chars = 100  # 故意设很小
+    results = [
+        {"type": "tool_result", "tool_use_id": f"id-{i}", "content": "X" * 5_000}
+        for i in range(50)
+    ]
+    out = core._enforce_aggregate_cap(results)
+    assert len(out) == 50
+    # 每条应有内容（至少 truncation marker），不能空
+    for r in out:
+        assert isinstance(r["content"], str)
+        assert len(r["content"]) > 0
+
+
 def test_tool_result_truncation_in_run_tool_loop(core: MiniBotCore) -> None:
     """端到端：tool 返回巨型字符串时，appended 到 messages 的 tool_result
     content 必须在 cap 范围内（含截断提示几百字符），不能让单条消息撑爆
