@@ -307,13 +307,21 @@ class ReadFileTool(Tool):
 
 
 class WriteFileTool(Tool):
-    """写文件，受 allowed_paths 限制；写前备份原文件，原子替换。"""
+    """写文件，受 allowed_paths 限制；写前备份原文件，原子替换。
+
+    max_content_bytes 防 prompt injection 诱导 LLM 把 workspace 撑满
+    （磁盘 DoS）。原子写还会产生临时文件 + 已有文件会产生 .bak，
+    放大写入量。在落盘前先按 UTF-8 编码后字节数判断。
+    """
+
+    DEFAULT_MAX_CONTENT_BYTES = 1_000_000  # 1MB，与 ReadFileTool.max_bytes 对称
 
     def __init__(
         self,
         allowed_paths: list[Path],
         forbidden_extensions: list[str] | None = None,
         make_backup: bool = True,
+        max_content_bytes: int | None = None,
     ) -> None:
         self.allowed_paths = {path.resolve() for path in allowed_paths}
         self.forbidden_extensions = {
@@ -321,6 +329,11 @@ class WriteFileTool(Tool):
             for ext in (forbidden_extensions or []) if ext
         }
         self.make_backup = make_backup
+        self.max_content_bytes = (
+            max_content_bytes
+            if max_content_bytes is not None
+            else self.DEFAULT_MAX_CONTENT_BYTES
+        )
 
     @property
     def name(self) -> str:
@@ -354,6 +367,19 @@ class WriteFileTool(Tool):
             return "Error: missing path"
         if not isinstance(content, str):
             return "Error: missing content"
+
+        # 大小上限：落盘前先按 UTF-8 字节数判断，避免：
+        #   1) 磁盘 DoS（prompt injection 让 LLM 写超大 content）
+        #   2) 原子写的 tempfile 把 disk usage 临时翻倍
+        #   3) make_backup=True 时 .bak 复制再翻一倍
+        # 同时也限制内存峰值（write_text 会一次性 encode 整段）
+        if self.max_content_bytes > 0:
+            encoded_size = len(content.encode("utf-8"))
+            if encoded_size > self.max_content_bytes:
+                return (
+                    f"Error: content too large "
+                    f"({encoded_size} > {self.max_content_bytes} bytes)"
+                )
 
         # 对父目录做 resolve（文件本身可能尚不存在），用父目录做白名单校验。
         target = Path(path)
