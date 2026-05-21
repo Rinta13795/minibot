@@ -23,6 +23,7 @@ import json
 import os
 import select
 import subprocess
+import time
 from typing import Any
 
 # 单行 JSON 上限（16 MB）— 真实 MCP 工具响应远小于这个值
@@ -53,6 +54,11 @@ class MCPClient:
         self._request_id = 0
         self.timeout_sec = timeout_sec
         self.max_line_bytes = max_line_bytes
+        # 每个 server 一个未消费的读缓冲。MCP server 完全可以在一次 stdout
+        # 写入里 flush 多条 JSON-RPC（一个响应 + 一条 notification，或者
+        # 两条响应连发）。如果不把溢出的字节保存下来，第二条响应会被永久
+        # 丢失，导致后续请求 readline 时无响应可读，超时 / id 错配。
+        self._read_buffers: dict[str, bytearray] = {}
 
     def start_all(self) -> None:
         """启动所有 MCP Server 子进程并完成 initialize 握手。
@@ -111,6 +117,7 @@ class MCPClient:
                 pass
         self._processes = {}
         self._tool_cache = {}
+        self._read_buffers = {}
 
     # ---------- JSON-RPC ----------
 
@@ -180,43 +187,60 @@ class MCPClient:
     def _readline_with_timeout(
         self, proc: subprocess.Popen, timeout_sec: float
     ) -> bytes | None:
-        """带超时的 readline。
+        """带超时的 readline，使用 per-server 持久 buffer 保留未消费字节。
+
+        关键正确性约束：MCP server 可能在一次 stdout 写入里 flush 多条
+        JSON-RPC（响应 + notification，或两条响应连发）。本函数必须只
+        从 buffer 中切出**一行**返回，把剩余字节保留在 buffer 里供下次
+        readline 使用，否则后续请求会读不到任何响应。
 
         Returns:
-            - bytes: 读到的一行（含 \\n）
-            - b"": EOF（子进程退出，stdout 关闭）
+            - bytes: 一行（含 \\n）
+            - b"": EOF（子进程退出，stdout 关闭，且 buffer 已空）
             - None: 超时
         """
         assert proc.stdout is not None
         fd = proc.stdout.fileno()
-        # select 在 macOS/Linux 上对 pipe 工作良好
-        ready, _, _ = select.select([fd], [], [], timeout_sec)
-        if not ready:
-            return None
+        # 用 server 名定位 buffer。同一 MCP server 的多次 readline 共享 buffer。
+        server_name = next(
+            (name for name, p in self._processes.items() if p is proc),
+            None,
+        )
+        if server_name is None:
+            # 兜底：不在已知 server 列表（理论上不应发生）—— 用临时 buffer
+            buf = bytearray()
+        else:
+            buf = self._read_buffers.setdefault(server_name, bytearray())
 
-        # 手动累积字节直到 \n 或超出 max_line_bytes
-        buf = bytearray()
+        deadline = time.monotonic() + timeout_sec
         while True:
-            chunk = os.read(fd, 8192)
-            if not chunk:
-                return bytes(buf)  # EOF
-            buf.extend(chunk)
-            if b"\n" in chunk:
-                # 切到第一个 \n 处；剩余部分留在内核缓冲区还是被吃掉？
-                # 简化处理：我们假设 MCP server 一次只发一整行（标准协议如此），
-                # 多行情况下需要更复杂的 buffer 管理。
-                nl = buf.index(b"\n")
+            # 1) 先看 buffer 里有没有已经完整的一行
+            nl = buf.find(b"\n")
+            if nl != -1:
                 line = bytes(buf[: nl + 1])
-                # 如果还有剩余，丢弃 — 实际生产应缓存供下次 readline
+                del buf[: nl + 1]
                 return line
+
             if len(buf) > self.max_line_bytes:
                 raise ValueError(
                     f"MCP response line exceeded {self.max_line_bytes} bytes (max_line_bytes)"
                 )
-            # 没读到换行 — 用 select 等下一批数据，剩余时间约等于初始 timeout（简化）
-            ready, _, _ = select.select([fd], [], [], timeout_sec)
+
+            # 2) 没有完整行 — 等下一批字节
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([fd], [], [], remaining)
             if not ready:
                 return None
+
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                # EOF：返回 buffer 里残留的部分（可能为空 = b""）
+                leftover = bytes(buf)
+                buf.clear()
+                return leftover
+            buf.extend(chunk)
 
     # ---------- 对外 API ----------
 

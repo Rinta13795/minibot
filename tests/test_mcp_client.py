@@ -152,3 +152,92 @@ time.sleep(10)
         client.start_all()
         client.close_all()
         client.close_all()  # 第二次不应抛
+
+    def test_multiple_responses_in_one_write_are_not_dropped(self, tmp_path: Path) -> None:
+        """server 一次 stdout.write 输出两条完整 JSON-RPC 响应；之前的实现
+        只返回第一行、丢弃第二行，导致后续 tools/call 永远等不到响应。"""
+        batch_server = """
+import json, sys
+
+def handle(req):
+    if req["method"] == "initialize":
+        return {"protocolVersion": "2024-11-05"}
+    if req["method"] == "tools/list":
+        # 提前把 tools/call 的响应也一起塞进同一次 write
+        # 我们假设 client 后续会用 id=3 调用 tools/call
+        list_resp = {"jsonrpc":"2.0","id":req["id"],"result":{"tools":[{"name":"ping","description":"p","inputSchema":{"type":"object"}}]}}
+        # 提前塞一条 id=3 的响应进同一次 write
+        early_call_resp = {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"PONG"}]}}
+        payload = json.dumps(list_resp) + "\\n" + json.dumps(early_call_resp) + "\\n"
+        sys.stdout.write(payload)
+        sys.stdout.flush()
+        return None  # 已手动写出
+    if req["method"] == "tools/call":
+        # 因为响应已经在 tools/list 时同批发出，这里啥也不发
+        return None
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    result = handle(req)
+    if result is not None:
+        sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":result}) + "\\n")
+        sys.stdout.flush()
+"""
+        path = _make_server(tmp_path, batch_server)
+        # 给 tools/call 较短的超时——如果 buffer 修复成功，应立刻从 buffer 读到预存的响应
+        client = MCPClient(
+            [MCPServerConfig(name="srv", command=sys.executable, args=[str(path)])],
+            timeout_sec=3,
+        )
+        try:
+            client.start_all()
+            # 第二次请求（tools/call）必须能从 buffer 中拿到 server 提前塞的 id=3 响应
+            result = client.call_tool("mcp_srv_ping", {})
+            assert result == "PONG"
+        finally:
+            client.close_all()
+
+    def test_response_plus_notification_in_one_write(self, tmp_path: Path) -> None:
+        """常见场景：响应紧跟着一条 notification（id=None），两者在同一次
+        write 里。buffer 必须保留 notification 行，再于下一次 readline 中被读出
+        并按 id 不匹配规则跳过——而不是把它整个吃掉导致后续响应错位。"""
+        notif_server = """
+import json, sys
+
+def respond(req, result):
+    notif = {"jsonrpc":"2.0","method":"server/log","params":{"msg":"noisy"}}
+    resp = {"jsonrpc":"2.0","id":req["id"],"result":result}
+    sys.stdout.write(json.dumps(resp) + "\\n" + json.dumps(notif) + "\\n")
+    sys.stdout.flush()
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    if req["method"] == "initialize":
+        respond(req, {"protocolVersion": "2024-11-05"})
+    elif req["method"] == "tools/list":
+        respond(req, {"tools":[{"name":"echo","description":"e","inputSchema":{"type":"object"}}]})
+    elif req["method"] == "tools/call":
+        respond(req, {"content":[{"type":"text","text":"OK"}]})
+"""
+        path = _make_server(tmp_path, notif_server)
+        client = MCPClient(
+            [MCPServerConfig(name="srv", command=sys.executable, args=[str(path)])],
+            timeout_sec=3,
+        )
+        try:
+            client.start_all()
+            # 上一次 initialize 后，notification 已留在 buffer。
+            # tools/list 必须跳过 notification、读到自己的响应。
+            schemas = client.list_tools()
+            assert any(s["name"] == "mcp_srv_echo" for s in schemas)
+            # 再来一次 tools/call，同样验证 buffer 工作
+            result = client.call_tool("mcp_srv_echo", {})
+            assert result == "OK"
+        finally:
+            client.close_all()
