@@ -46,11 +46,16 @@ class MiniBotCore:
         anthropic_api_key: str,
         model: str = "claude-sonnet-4-5",
         max_iterations: int = 10,
+        max_history_messages: int = 40,
     ) -> None:
         self.workspace = workspace
         self.config = config
         self.model = model
         self.max_iterations = max_iterations
+        # 滑动窗口上限——超过会在每次 API 调用前触发 _compact_messages。
+        # interactive 长会话 / 巨型工具输出 / 多次 MCP 大响应都会堆积
+        # messages，最终撞 Anthropic 的 context window 限额报错。
+        self.max_history_messages = max_history_messages
 
         # Anthropic client
         self._client = anthropic.Anthropic(api_key=anthropic_api_key)
@@ -161,6 +166,7 @@ class MiniBotCore:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         model = config.get("model", "claude-sonnet-4-5")
         max_iterations = config.get("max_iterations", 10)
+        max_history_messages = config.get("max_history_messages", 40)
 
         workspace_str = config.get("workspace", "./workspace")
         workspace = Path(workspace_str)
@@ -174,6 +180,7 @@ class MiniBotCore:
             anthropic_api_key=api_key,
             model=model,
             max_iterations=max_iterations,
+            max_history_messages=max_history_messages,
         )
 
     # ------------------------------------------------------------------ system prompt
@@ -298,6 +305,10 @@ class MiniBotCore:
         tool_schemas = self.tools.get_schemas() + self.mcp_client.list_tools()
 
         for _ in range(self.max_iterations):
+            # 每次 API 调用前做滑动窗口截断，避免 messages 无限增长撞
+            # Anthropic context window。只在每个迭代开始截断，保证 messages
+            # 此刻处于「完整对话单元」状态（user 输入，或 user(tool_result) 收尾）。
+            self._compact_messages()
             response = self._call_api_with_retry(system_prompt, tool_schemas)
 
             # Append assistant turn to history
@@ -325,6 +336,39 @@ class MiniBotCore:
             self.messages.append({"role": "user", "content": tool_results})
 
         raise RuntimeError(f"tool_use loop exceeded max_iterations={self.max_iterations}")
+
+    def _compact_messages(self) -> None:
+        """滑动窗口截断：当 messages 超过 max_history_messages 时丢弃旧消息。
+
+        关键正确性约束：Anthropic API 要求 assistant 的 tool_use 块与紧接
+        其后的 user tool_result 块必须配对。简单 messages[-N:] 切片可能让
+        kept[0] 是一条 user(tool_result) 但对应的 assistant(tool_use) 已被
+        丢弃，下次 API 请求立即 HTTP 400。
+
+        正确策略：从理想切点开始向后扫描，找第一条「fresh user 输入」
+        （role=user 且 content 是字符串，不是 tool_result 列表）作为安全
+        切点；之前的全部丢弃。这样保留的窗口永远从一个完整对话回合开始。
+
+        如果窗口里找不到任何 fresh user（极端情况：一次 tool_use 循环
+        产生超过 max_history_messages 条消息），不截断——下一轮 chat 调用
+        的新 user 输入会重新提供安全切点。
+        """
+        if len(self.messages) <= self.max_history_messages:
+            return
+
+        # 理想切点：保留尾部 max_history_messages 条
+        cut = len(self.messages) - self.max_history_messages
+
+        # 向后找第一条 fresh user 输入
+        while cut < len(self.messages):
+            msg = self.messages[cut]
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                break
+            cut += 1
+
+        if cut <= 0 or cut >= len(self.messages):
+            return  # 无可丢弃 / 无安全切点
+        self.messages = self.messages[cut:]
 
     def _call_api_with_retry(self, system_prompt: str, tool_schemas: list[dict[str, Any]]) -> Any:
         """调用 Anthropic API，失败时最多重试 3 次（指数退避）。"""

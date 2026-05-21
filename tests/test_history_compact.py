@@ -1,0 +1,158 @@
+"""tests/test_history_compact.py — messages 滑动窗口截断测试。
+
+代码审查严重问题 #3：messages 无限增长撞 context window。
+本文件验证 _compact_messages 在不同对话模式下都能安全截断，且不会
+留下孤儿 tool_result（即被丢弃的 tool_use 对应的 tool_result）。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from minibot.core import MiniBotCore
+
+
+@pytest.fixture
+def core(tmp_path: Path) -> MiniBotCore:
+    config = {
+        "workspace": str(tmp_path),
+        "model": "claude-sonnet-4-5",
+        "max_iterations": 5,
+        "identity": "test",
+        "tools": {
+            "exec": {"enabled": False, "cmd_whitelist": []},
+            "read_file": {"enabled": False, "allowed_paths": []},
+            "write_file": {"enabled": False, "allowed_paths": []},
+        },
+        "skills": {"skills_dirs": []},
+        "memory": {},
+        "mcp_servers": {},
+        "scheduled_tasks": [],
+    }
+    return MiniBotCore(
+        workspace=tmp_path,
+        config=config,
+        anthropic_api_key="fake-key",
+        max_history_messages=10,
+    )
+
+
+def test_short_conversation_not_truncated(core: MiniBotCore) -> None:
+    core.messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    core._compact_messages()
+    assert len(core.messages) == 2
+
+
+def test_long_text_conversation_truncated_to_fresh_user_boundary(
+    core: MiniBotCore,
+) -> None:
+    # 30 条交替的 user/assistant 文本消息（无 tool_use）
+    msgs: list[dict[str, Any]] = []
+    for i in range(15):
+        msgs.append({"role": "user", "content": f"msg-{i}"})
+        msgs.append({"role": "assistant", "content": f"reply-{i}"})
+    core.messages = msgs
+
+    core._compact_messages()
+
+    # 应被截断到接近 max_history_messages=10 的尾部
+    assert len(core.messages) <= 10
+    # 第一条必须是 fresh user 输入
+    assert core.messages[0]["role"] == "user"
+    assert isinstance(core.messages[0]["content"], str)
+
+
+def test_truncation_does_not_leave_orphan_tool_result(
+    core: MiniBotCore,
+) -> None:
+    """关键正确性：截断不能让 kept[0] 是 user(tool_result) 而对应的
+    assistant(tool_use) 已被丢弃——Anthropic 会立刻返回 HTTP 400。"""
+    # 构造一段含 tool_use 的对话：
+    #   user(str) → assistant(tool_use) → user(tool_result) → assistant(text)
+    # 重复多次让总长超过 max_history_messages
+    msgs: list[dict[str, Any]] = []
+    for i in range(6):
+        msgs.append({"role": "user", "content": f"task-{i}"})
+        msgs.append({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": f"call-{i}", "name": "x", "input": {}}],
+        })
+        msgs.append({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": f"call-{i}", "content": "ok"}],
+        })
+        msgs.append({"role": "assistant", "content": f"final-{i}"})
+    core.messages = msgs
+
+    core._compact_messages()
+
+    # kept[0] 必须是 fresh user 输入（str content），不能是 tool_result
+    first = core.messages[0]
+    assert first["role"] == "user"
+    assert isinstance(first["content"], str), (
+        f"truncation left an orphan tool_result as first kept message: "
+        f"role={first['role']}, content_type={type(first['content']).__name__}"
+    )
+
+
+def test_truncation_no_safe_boundary_keeps_all(core: MiniBotCore) -> None:
+    """极端情况：一次 tool_use 循环产生超过 max_history_messages 条消息
+    （都是 assistant + user(tool_result)，没有 fresh user 输入夹在中间）
+    → 不应截断，等下一轮新 user 输入再压缩。"""
+    msgs: list[dict[str, Any]] = [{"role": "user", "content": "task"}]  # 仅一条 fresh
+    # 之后塞 30 条交替的 assistant(tool_use) / user(tool_result)
+    for i in range(15):
+        msgs.append({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": f"call-{i}", "name": "x", "input": {}}],
+        })
+        msgs.append({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": f"call-{i}", "content": "r"}],
+        })
+    core.messages = list(msgs)
+
+    core._compact_messages()
+
+    # 理想切点 = len - 10 = 21（在 tool 循环中间）。从 21 向后找 fresh user，
+    # 但后面全是 tool_use / tool_result，找不到——不截断。
+    assert len(core.messages) == len(msgs)
+
+
+def test_compact_idempotent(core: MiniBotCore) -> None:
+    msgs: list[dict[str, Any]] = []
+    for i in range(15):
+        msgs.append({"role": "user", "content": f"u{i}"})
+        msgs.append({"role": "assistant", "content": f"a{i}"})
+    core.messages = msgs
+
+    core._compact_messages()
+    first_pass = list(core.messages)
+    core._compact_messages()
+    assert core.messages == first_pass
+
+
+def test_config_max_history_messages_passed_through(tmp_path: Path) -> None:
+    """from_config 必须把 config["max_history_messages"] 透传给实例。"""
+    import json
+    config = {
+        "workspace": str(tmp_path),
+        "model": "test-model",
+        "max_iterations": 3,
+        "max_history_messages": 7,
+        "tools": {},
+        "skills": {"skills_dirs": []},
+        "memory": {},
+        "mcp_servers": {},
+    }
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(config), encoding="utf-8")
+
+    core = MiniBotCore.from_config(cfg_path)
+    assert core.max_history_messages == 7
