@@ -370,11 +370,17 @@ class MiniBotCore:
         无法守住 max_aggregate_tool_result_chars。
 
         策略：
+          - cap == 0：返回空串（这是 aggregate cap < N 时的边界路径，
+            每个 tool_result 必须出现以保持 1:1 配对，但实际内容为空）
           - cap 够大 → 头尾两段（3:1）+ 省略 marker
           - cap 装不下 marker → 直接硬截
           - 末尾再做一次 len(out) > cap 的兜底，截到原文前 cap 字符
         """
-        if not isinstance(text, str) or cap <= 0 or len(text) <= cap:
+        if not isinstance(text, str):
+            return text
+        if cap <= 0:
+            return ""
+        if len(text) <= cap:
             return text
 
         # 选最短可读 marker（短 marker 让 head/tail 留更多预算）。
@@ -438,9 +444,11 @@ class MiniBotCore:
             return tool_results
 
         n = len(tool_results)
-        # 严格 = cap // n。N 极大时 per_budget 会很小，但 _truncate_text
-        # 保证 ≤ cap，所以总和始终 ≤ N * (cap//N) ≤ cap。
-        per_budget = max(cap // n, 1)  # 至少 1，避免传入 0 时 hardcut 为空
+        # 严格 = cap // n，**无 floor**。N 极大时 per_budget 可能为 0
+        # （cap < n 的病态配置）；此时每条 tool_result.content 退化成
+        # 空串，仍保留 tool_use_id ↔ tool_result 的 1:1 配对，
+        # 聚合 = 0 ≤ cap。任何抬底（哪怕 1）都会让 n * 1 > cap 反向超额。
+        per_budget = cap // n
         adjusted: list[dict[str, Any]] = []
         for r in tool_results:
             content = r.get("content")

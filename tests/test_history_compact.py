@@ -253,11 +253,42 @@ def test_aggregate_cap_strict_under_tiny_cap(core: MiniBotCore) -> None:
 
 
 def test_truncate_text_output_always_within_cap(core: MiniBotCore) -> None:
-    """_truncate_text 的核心不变式：output 严格 ≤ cap。"""
+    """_truncate_text 的核心不变式：output 严格 ≤ cap。覆盖含 0
+    在内的整个边界范围。"""
     text = "Z" * 10_000
-    for cap in [1, 10, 50, 100, 500, 1000, 5000, 9999, 10001]:
+    for cap in [0, 1, 10, 50, 100, 500, 1000, 5000, 9999, 10001]:
         out = core._truncate_text(text, cap)
         assert len(out) <= cap, f"cap={cap}: len(out)={len(out)} > {cap}"
+
+
+def test_truncate_text_zero_cap_returns_empty(core: MiniBotCore) -> None:
+    """cap == 0 必须返回空串，而不是把 cap<=0 当 no-op 返回原文。这是
+    aggregate cap < N 时 per_budget=0 路径依赖的不变式。"""
+    assert core._truncate_text("hello", 0) == ""
+    assert core._truncate_text("", 0) == ""
+    assert core._truncate_text("X" * 100, 0) == ""
+
+
+def test_aggregate_cap_strict_when_cap_smaller_than_n(core: MiniBotCore) -> None:
+    """病态配置 cap < n：cap // n = 0，每条 tool_result 退化为空串。
+    聚合必须严格 = 0 ≤ cap，且 tool_use_id ↔ tool_result 的 1:1 配对
+    完全保留。"""
+    core.max_aggregate_tool_result_chars = 5  # 故意小于 n
+    n = 10
+    results = [
+        {"type": "tool_result", "tool_use_id": f"id-{i}", "content": "Y" * 1000}
+        for i in range(n)
+    ]
+    out = core._enforce_aggregate_cap(results)
+    # 1:1 配对保留
+    assert len(out) == n
+    assert [r["tool_use_id"] for r in out] == [r["tool_use_id"] for r in results]
+    # 聚合严格守住 cap（实际 0）
+    total = sum(len(r["content"]) for r in out)
+    assert total <= core.max_aggregate_tool_result_chars
+    # 每条内容退化为空字符串
+    for r in out:
+        assert r["content"] == ""
 
 
 def test_tool_result_truncation_in_run_tool_loop(core: MiniBotCore) -> None:
