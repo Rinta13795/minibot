@@ -211,29 +211,53 @@ def test_aggregate_cap_shrinks_each_result_when_over_limit(
     # 每条 tool_use_id 都必须仍有对应 tool_result（API 1:1 约束）
     assert len(out) == 10
     assert [r["tool_use_id"] for r in out] == [r["tool_use_id"] for r in results]
-    # 聚合大小应在 cap 附近（含每条的省略提示开销）
+    # 严格 ≤ cap：不再用 *2 的宽松上界，必须 100% 守住
     total = sum(len(r["content"]) for r in out)
-    assert total <= core.max_aggregate_tool_result_chars * 2  # 含 marker 开销
+    assert total <= core.max_aggregate_tool_result_chars
     # 每条都应被截短
     for r in out:
         assert len(r["content"]) < 20_000
-        assert "truncated" in r["content"].lower()
 
 
-def test_aggregate_cap_preserves_minimum_per_result(core: MiniBotCore) -> None:
-    """N 极大时 cap / N 会非常小；下限 200 字符保证每个 tool_use_id
-    至少有可读响应，不会被压成空串。"""
-    core.max_aggregate_tool_result_chars = 100  # 故意设很小
+def test_aggregate_cap_strict_under_extreme_n(core: MiniBotCore) -> None:
+    """关键回归：极大 N 时 cap // N 很小，原 floor=200 实现会导致
+    N × 200 > cap 反向超额。修复后 _truncate_text 严格 ≤ cap，聚合
+    必须始终 ≤ cap。"""
+    core.max_aggregate_tool_result_chars = 80_000
+    n = 1000
     results = [
         {"type": "tool_result", "tool_use_id": f"id-{i}", "content": "X" * 5_000}
-        for i in range(50)
+        for i in range(n)
     ]
     out = core._enforce_aggregate_cap(results)
-    assert len(out) == 50
-    # 每条应有内容（至少 truncation marker），不能空
-    for r in out:
-        assert isinstance(r["content"], str)
-        assert len(r["content"]) > 0
+    assert len(out) == n
+    total = sum(len(r["content"]) for r in out)
+    assert total <= core.max_aggregate_tool_result_chars, (
+        f"aggregate {total} exceeded cap {core.max_aggregate_tool_result_chars} "
+        f"with N={n}"
+    )
+
+
+def test_aggregate_cap_strict_under_tiny_cap(core: MiniBotCore) -> None:
+    """另一极端：cap 比 marker 字符串还小。_truncate_text 必须硬截
+    而不是因 marker 反向把 output 撑大。"""
+    core.max_aggregate_tool_result_chars = 50
+    results = [
+        {"type": "tool_result", "tool_use_id": f"id-{i}", "content": "Y" * 1000}
+        for i in range(10)
+    ]
+    out = core._enforce_aggregate_cap(results)
+    assert len(out) == 10
+    total = sum(len(r["content"]) for r in out)
+    assert total <= core.max_aggregate_tool_result_chars
+
+
+def test_truncate_text_output_always_within_cap(core: MiniBotCore) -> None:
+    """_truncate_text 的核心不变式：output 严格 ≤ cap。"""
+    text = "Z" * 10_000
+    for cap in [1, 10, 50, 100, 500, 1000, 5000, 9999, 10001]:
+        out = core._truncate_text(text, cap)
+        assert len(out) <= cap, f"cap={cap}: len(out)={len(out)} > {cap}"
 
 
 def test_tool_result_truncation_in_run_tool_loop(core: MiniBotCore) -> None:

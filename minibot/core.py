@@ -362,26 +362,43 @@ class MiniBotCore:
         raise RuntimeError(f"tool_use loop exceeded max_iterations={self.max_iterations}")
 
     def _truncate_text(self, text: str, cap: int) -> str:
-        """把 text 截到 cap 字符以内，保留头尾两端 + 省略提示。
+        """把 text 截到 ≤ cap 字符以内，保留头尾两端 + 省略提示。
 
-        保留头尾两端是因为大输出关键信息通常分布在两端（错误堆栈 /
-        启动横幅在前，退出状态 / 总结在尾），中间多为重复进度日志，
-        截掉对模型推理影响最小。头 3 : 尾 1，留 200 字符给省略提示。
+        严格保证 `len(output) <= cap`——这是 _enforce_aggregate_cap 算
+        per-result 预算时的关键不变式。否则当 cap 很小时（极大 N 下的
+        cap/N），marker 字符串本身的长度可能反而超过 cap，让聚合截断
+        无法守住 max_aggregate_tool_result_chars。
+
+        策略：
+          - cap 够大 → 头尾两段（3:1）+ 省略 marker
+          - cap 装不下 marker → 直接硬截
+          - 末尾再做一次 len(out) > cap 的兜底，截到原文前 cap 字符
         """
         if not isinstance(text, str) or cap <= 0 or len(text) <= cap:
             return text
-        budget = max(cap - 200, cap // 2)
-        head_len = budget * 3 // 4
-        tail_len = budget - head_len
+
+        # 选最短可读 marker（短 marker 让 head/tail 留更多预算）。
+        # 含 "truncated" 关键字便于 grep/测试。
+        marker_template = "\n[... truncated {} chars ...]\n"
+        sample_marker = marker_template.format(len(text))
+        marker_len = len(sample_marker)
+
+        if marker_len + 4 >= cap:
+            # cap 太小，连 marker 都装不下 → 硬截
+            return text[:cap]
+
+        body_budget = cap - marker_len
+        head_len = body_budget * 3 // 4
+        tail_len = body_budget - head_len
         head = text[:head_len]
         tail = text[-tail_len:] if tail_len > 0 else ""
         omitted = len(text) - head_len - tail_len
-        return (
-            f"{head}\n"
-            f"\n[... truncated {omitted} characters; original {len(text)} chars, "
-            f"cap {cap} ...]\n\n"
-            f"{tail}"
-        )
+        out = f"{head}{marker_template.format(omitted)}{tail}"
+        # 安全兜底：理论上不会触发，但保证 len(out) <= cap 是 aggregate
+        # 算法依赖的硬约束
+        if len(out) > cap:
+            return text[:cap]
+        return out
 
     def _truncate_tool_result(self, result: str) -> str:
         """单条工具结果超过 max_tool_result_chars 时截断。"""
@@ -390,15 +407,23 @@ class MiniBotCore:
     def _enforce_aggregate_cap(
         self, tool_results: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """一次 turn 内全部 tool_result 聚合不超过 max_aggregate_tool_result_chars。
+        """一次 turn 内全部 tool_result 聚合**严格** ≤ max_aggregate_tool_result_chars。
 
         模型可以在同一个 assistant 回复里发出多个 tool_use 块，所有
-        tool_result 块进同一条 user message——单条 cap 限不住聚合
-        （N × per_cap 仍可任意大）。
+        tool_result 块进同一条 user message——单条 cap 限不住聚合。
 
-        关键约束：tool_use_id 与 tool_result 必须 1:1 配对（少了 API 400），
-        所以永远不能跳过任何 tool_result，只能进一步截短到 cap / N 的
-        per-result 预算。下限 200 字符，避免极端 N 时结果近乎为空。
+        关键约束：
+          - tool_use_id 与 tool_result 必须 1:1 配对（少了 API 400），
+            所以永远不能跳过任何 tool_result，只能进一步截短。
+          - 不能给 per_budget 设 floor（之前的 max(cap//n, 200) 让
+            N*200 > cap），否则极大 N 时会反向超额 cap。
+          - 依赖 _truncate_text 严格 ≤ cap 的不变式来保证总和。
+
+        算法：
+          1. 算原始 total；不超 cap 则直接返回
+          2. 否则 per_budget = cap // n（**无 floor**）
+          3. 每个 result 用 _truncate_text 截到 ≤ per_budget
+          4. 总和 = sum(min(L_i, per_budget)) ≤ n * per_budget ≤ cap ✓
         """
         cap = self.max_aggregate_tool_result_chars
         if cap <= 0 or not tool_results:
@@ -413,7 +438,9 @@ class MiniBotCore:
             return tool_results
 
         n = len(tool_results)
-        per_budget = max(cap // n, 200)
+        # 严格 = cap // n。N 极大时 per_budget 会很小，但 _truncate_text
+        # 保证 ≤ cap，所以总和始终 ≤ N * (cap//N) ≤ cap。
+        per_budget = max(cap // n, 1)  # 至少 1，避免传入 0 时 hardcut 为空
         adjusted: list[dict[str, Any]] = []
         for r in tool_results:
             content = r.get("content")
