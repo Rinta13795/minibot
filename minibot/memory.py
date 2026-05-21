@@ -53,8 +53,31 @@ class MemoryStore:
     def __init__(self, workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         self.memory_path = workspace / "MEMORY.md"
-        if not self.memory_path.exists():
+        # 已知合法的 section 名集合 — _parse_sections 用它过滤 ## 标题：
+        # 在集合中的 ## X 视为 section 边界；不在集合中的 ## X 视为
+        # section body 里的 Markdown 二级标题，不切分。
+        #
+        # 初始集合 = DEFAULT_SECTIONS，下面会再从磁盘上已有的 ## 标题里
+        # 扫描出 write_section 创建过的自定义 section 加入集合，保证重启
+        # 后旧的自定义 section 仍能被识别。
+        self._known_sections: set[str] = set(self.DEFAULT_SECTIONS)
+        if self.memory_path.exists():
+            self._seed_known_sections_from_disk()
+        else:
             self.write_all(self._render_sections([(name, "") for name in self.DEFAULT_SECTIONS]))
+
+    def _seed_known_sections_from_disk(self) -> None:
+        """启动时把磁盘上已有的 ## 标题登记到 _known_sections。
+
+        这一步只在 __init__ 跑一次，保证旧 MEMORY.md 文件里通过
+        write_section 创建的自定义 section（比如 "history"、"zeta"）
+        在重启后仍能被识别。注意：如果旧文件因 pre-fix bug 已经被
+        污染（body 里混入了 ## X 被误切成 section），重启时会把那个
+        X 也当成 known section；该 case 需要人工清理。
+        """
+        content = self.memory_path.read_text(encoding="utf-8")
+        for m in re.finditer(r"^##\s+(.+?)\s*$", content, flags=re.MULTILINE):
+            self._known_sections.add(m.group(1).strip())
 
     # ---------- 文件锁 ----------
 
@@ -119,6 +142,10 @@ class MemoryStore:
     def write_section(self, section: str, content: str) -> None:
         """覆盖某个 section 的内容；section 不存在则追加到文件末尾。"""
         with self._locked(exclusive=True):
+            # 先登记，让 _parse_sections 在「读出当前文件」时就把要写的
+            # section 视为合法 — 否则首次 write_section("custom") 解析
+            # 自己刚写过的 section 时会找不到。
+            self._known_sections.add(section)
             sections = self._parse_sections(self._read_unlocked())
             normalized = content.strip()
             updated = False
@@ -154,6 +181,7 @@ class MemoryStore:
     def _append_locked(self, section: str, line: str) -> None:
         """读改写一体，在同一把独占锁下完成，避免并发丢数据。"""
         with self._locked(exclusive=True):
+            self._known_sections.add(section)
             sections = self._parse_sections(self._read_unlocked())
             updated = False
             new_sections: list[tuple[str, str]] = []
@@ -204,11 +232,21 @@ class MemoryStore:
         tmp_path.write_text(content, encoding="utf-8")
         os.replace(tmp_path, self.memory_path)
 
-    @staticmethod
-    def _parse_sections(content: str) -> list[tuple[str, str]]:
-        # ^##\s+name$  匹配 2 个或多个 # 中的 2 个（一级 section 用 ## 表示）
-        # 注意：跳过 # MEMORY.md 顶级标题，只匹配二级。
-        matches = list(re.finditer(r"^##\s+(.+?)\s*$", content, flags=re.MULTILINE))
+    def _parse_sections(self, content: str) -> list[tuple[str, str]]:
+        """把 MEMORY.md 切成 (name, body) 列表。
+
+        关键正确性约束：只有 self._known_sections 里的 ## X 才作为
+        section 边界。不在白名单的 ## X 视为 body 里的 Markdown 二级
+        标题，不切分。否则用户在 ## user 正文里写一个 `## 早安`，
+        re.finditer 会把它当成新 section，下次 write_section("user")
+        只覆盖第一段，剩下的 `## 早安\\n...` 留在文件里造成记忆错位。
+        """
+        # 匹配所有候选 ## 标题，再按 known whitelist 过滤
+        matches = [
+            m
+            for m in re.finditer(r"^##\s+(.+?)\s*$", content, flags=re.MULTILINE)
+            if m.group(1).strip() in self._known_sections
+        ]
         if not matches:
             return []
 

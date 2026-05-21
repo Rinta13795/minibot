@@ -118,3 +118,64 @@ class TestMemoryStore:
         store.update_section("user", "alice")
         assert store.get_section("user") == "alice"
         assert "alice" in store.read_memory()
+
+    def test_body_with_unknown_h2_heading_is_not_split(self, tmp_path: Path) -> None:
+        """body 里出现 `## 小标题`（非已知 section 名）不能被误切成新 section。"""
+        store = MemoryStore(workspace=tmp_path)
+        body_with_h2 = (
+            "我喜欢的格式如下：\n"
+            "## 早安风格\n"
+            "你好呀\n"
+            "## 晚安风格\n"
+            "晚安"
+        )
+        store.write_section("user", body_with_h2)
+
+        # 写入后 read 应拿回完整 body（含两个 ## 子标题）
+        assert store.read_section("user") == body_with_h2
+        # list_sections 不应把 "早安风格" / "晚安风格" 当成独立 section
+        sections = store.list_sections()
+        assert "早安风格" not in sections
+        assert "晚安风格" not in sections
+
+    def test_body_h2_survives_subsequent_write_to_other_section(
+        self, tmp_path: Path
+    ) -> None:
+        """body 里有 `## 小标题` 时，写其他 section 不能把它撕掉。
+
+        这是代码审查指出的核心 race window：原实现下，write_section("user")
+        在解析阶段把 body 内的 ## X 当 section 切走，再次写时只覆盖第一段，
+        造成「## X\\n...」内容残留为孤儿 section。
+        """
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", "前缀\n## 中间标题\n后缀")
+        # 再写另一个合法 section
+        store.write_section("project", "p")
+        # 再写 user，验证原来的 ## 中间标题 还在
+        store.write_section("user", "前缀\n## 中间标题\n后缀")
+
+        assert store.read_section("user") == "前缀\n## 中间标题\n后缀"
+        assert store.read_section("project") == "p"
+        assert "中间标题" not in store.list_sections()
+
+    def test_h2_matching_known_section_still_splits(self, tmp_path: Path) -> None:
+        """边角情况：body 里写一个文本恰好等于已知 section 名（如 ## project）。
+
+        这种情况下白名单方案仍会切分——这是已知的不可避免的歧义，必须由调
+        用方避免（或对内容做转义）。本测试只是把当前预期行为锁定下来，便于
+        将来如改成更稳健的结构化格式时及时发现。
+        """
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", "起头\n## project\n冒充")
+        # 当前行为：## project 会被识别为 section 边界
+        assert "## project" not in store.read_section("user")
+
+    def test_known_section_seeded_from_disk_on_reopen(self, tmp_path: Path) -> None:
+        """write_section("zeta") 写入后，新实例重新打开 MEMORY.md，
+        仍能识别 zeta 是合法 section。"""
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("zeta", "z-content")
+        # 模拟进程重启
+        store2 = MemoryStore(workspace=tmp_path)
+        assert "zeta" in store2.list_sections()
+        assert store2.read_section("zeta") == "z-content"
