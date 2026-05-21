@@ -76,6 +76,28 @@ class TestExecTool:
         with pytest.raises(ValueError, match="dangerous executors"):
             ExecTool(cmd_whitelist=["ls", disguised], workspace=tmp_path)
 
+    @pytest.mark.parametrize(
+        "case_variant",
+        [
+            "Python3",
+            "PYTHON3",
+            "PyThOn3",
+            "BASH",
+            "Git",
+            "CAT",
+            "/usr/bin/PYTHON3",
+            "/USR/BIN/python3",
+            "Python3.EXE",
+            "PYTHON3.exe",
+        ],
+    )
+    def test_rejects_case_variants_of_dangerous_executor(
+        self, tmp_path: Path, case_variant: str
+    ) -> None:
+        # macOS HFS+ 与 Windows 都是大小写不敏感，必须按小写归一化比对
+        with pytest.raises(ValueError, match="dangerous executors"):
+            ExecTool(cmd_whitelist=["ls", case_variant], workspace=tmp_path)
+
     def test_dangerous_executors_constant_covers_required_set(self) -> None:
         # 安全审计要求的最小拒绝集（如果将来误删，此测试会提醒）
         must_block = {

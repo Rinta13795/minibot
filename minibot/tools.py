@@ -65,14 +65,21 @@ COMMAND_SPLICE_TOKENS: tuple[str, ...] = (
 def _executable_basename(name: str) -> str:
     """从命令/路径中提取可执行文件名用于安全比较。
 
-    将 "/usr/bin/python3"、"./python3"、"..\\python3.exe" 等都归一为
-    "python3"（Windows 上同时去掉 .exe）。这是防止
-    DANGEROUS_EXECUTORS 字面量集合校验被路径前缀绕过的关键。
+    归一化策略：
+      1. 去掉路径前缀（/usr/bin/python3 → python3）
+      2. 去掉 .exe 后缀（python3.EXE → python3）
+      3. 全部转为小写
+
+    第 3 步至关重要——macOS 默认 HFS+ 与 Windows NTFS 都是大小写不
+    敏感的，"Python3"、"PYTHON3" 都会实际执行 python3。若不归一化
+    大小写，DANGEROUS_EXECUTORS 字面量集合校验会被简单大小写变体
+    绕过。Linux 上 lower-case 比较虽然会带来微小误报风险，但
+    DANGEROUS_EXECUTORS 列出的都是众所周知小写命名的工具，可接受。
     """
     base = os.path.basename(name.strip())
     if base.lower().endswith(".exe"):
         base = base[:-4]
-    return base
+    return base.lower()
 
 
 DANGEROUS_EXECUTORS: frozenset[str] = frozenset({
