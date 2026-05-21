@@ -21,8 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import anthropic
-
+from minibot.llm import make_client
 from minibot.memory import MemoryStore
 from minibot.mcp_client import MCPClient, MCPServerConfig
 from minibot.scheduler import CronJob, Scheduler
@@ -46,14 +45,17 @@ class MiniBotCore:
         anthropic_api_key: str,
         model: str = "claude-sonnet-4-5",
         max_iterations: int = 10,
+        provider: str = "anthropic",
+        base_url: str | None = None,
     ) -> None:
         self.workspace = workspace
         self.config = config
         self.model = model
         self.max_iterations = max_iterations
+        self.provider = provider
 
-        # Anthropic client
-        self._client = anthropic.Anthropic(api_key=anthropic_api_key)
+        # LLM client (Anthropic / DeepSeek / OpenAI 等)
+        self._client = make_client(provider=provider, api_key=anthropic_api_key, base_url=base_url)
 
         # Tool registry
         self.tools = ToolRegistry()
@@ -74,7 +76,12 @@ class MiniBotCore:
 
         # MCP client
         mcp_servers = [
-            MCPServerConfig(name=name, command=srv["command"], args=srv.get("args", []))
+            MCPServerConfig(
+                name=name,
+                command=srv["command"],
+                args=srv.get("args", []),
+                env=srv.get("env", {}),
+            )
             for name, srv in config.get("mcp_servers", {}).items()
         ]
         self.mcp_client = MCPClient(servers=mcp_servers)
@@ -153,12 +160,26 @@ class MiniBotCore:
 
     @classmethod
     def from_config(cls, config_path: str | Path) -> "MiniBotCore":
-        """从 config.json 路径构造实例的便捷方法。"""
+        """从 config.json 路径构造实例的便捷方法。
+
+        Provider 选择：config["provider"] = "anthropic" | "deepseek" | "openai"
+        API key 从对应环境变量读取：
+            anthropic  → ANTHROPIC_API_KEY
+            deepseek   → DEEPSEEK_API_KEY
+            openai     → OPENAI_API_KEY
+        """
         config_path = Path(config_path)
         with open(config_path, encoding="utf-8") as f:
             config = json.load(f)
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        provider = config.get("provider", "anthropic").lower()
+        env_key = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "openai": "OPENAI_API_KEY",
+        }.get(provider, "ANTHROPIC_API_KEY")
+        api_key = os.environ.get(env_key, "")
+        base_url = config.get("base_url")
         model = config.get("model", "claude-sonnet-4-5")
         max_iterations = config.get("max_iterations", 10)
 
@@ -174,6 +195,8 @@ class MiniBotCore:
             anthropic_api_key=api_key,
             model=model,
             max_iterations=max_iterations,
+            provider=provider,
+            base_url=base_url,
         )
 
     # ------------------------------------------------------------------ system prompt
@@ -327,19 +350,17 @@ class MiniBotCore:
         raise RuntimeError(f"tool_use loop exceeded max_iterations={self.max_iterations}")
 
     def _call_api_with_retry(self, system_prompt: str, tool_schemas: list[dict[str, Any]]) -> Any:
-        """调用 Anthropic API，失败时最多重试 3 次（指数退避）。"""
+        """调用 LLM API，失败时最多重试 3 次（指数退避）。"""
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                kwargs: dict[str, Any] = {
-                    "model": self.model,
-                    "max_tokens": 4096,
-                    "system": system_prompt,
-                    "messages": self.messages,
-                }
-                if tool_schemas:
-                    kwargs["tools"] = tool_schemas
-                return self._client.messages.create(**kwargs)
+                return self._client.create(
+                    model=self.model,
+                    system=system_prompt,
+                    messages=self.messages,
+                    tools=tool_schemas,
+                    max_tokens=4096,
+                )
             except Exception as exc:
                 last_exc = exc
                 if attempt < 2:

@@ -9,9 +9,18 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from minibot.tools import ExecTool, ReadFileTool, ToolRegistry, WriteFileTool
+import pytest
+
+from minibot.tools import (
+    ExecTool,
+    ReadFileTool,
+    ToolRegistry,
+    WriteFileTool,
+    safe_subprocess_env,
+)
 
 
 # ============================================================
@@ -35,6 +44,54 @@ class TestExecTool:
         tool = ExecTool(cmd_whitelist=["sleep"], workspace=tmp_path, timeout_sec=1)
         result = tool.execute(command="sleep 5")
         assert "timed out" in result.lower() or result.startswith("Error")
+
+    def test_safe_subprocess_env_excludes_sensitive_vars(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # 父进程持有敏感凭据
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-leak-canary")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-canary")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_canary")
+        monkeypatch.setenv("DATABASE_URL", "postgres://u:p@h/d")
+
+        env = safe_subprocess_env(tmp_path)
+
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        assert "GITHUB_TOKEN" not in env
+        assert "DATABASE_URL" not in env
+        # 但执行所需的最小环境必须存在
+        assert "PATH" in env
+        assert env["HOME"] == str(tmp_path.resolve())
+        assert env["LANG"] == "C.UTF-8"
+
+    def test_exec_subprocess_does_not_leak_api_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 端到端：ExecTool 真的跑子进程，stdout 里不应含 canary。
+        # 用 ls 列 /tmp 的内容 + 把环境变量名也设成 canary 字符串验证。
+        canary = "sk-ant-CANARY-XYZ-leak"
+        monkeypatch.setenv("ANTHROPIC_API_KEY", canary)
+
+        # 借助 Python 子进程直接验证 ExecTool 传给 subprocess.run 的 env。
+        # 我们 monkeypatch subprocess.run 截获 env 参数。
+        captured: dict = {}
+        import minibot.tools as tools_module
+        real_run = tools_module.subprocess.run
+
+        def fake_run(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(tools_module.subprocess, "run", fake_run)
+
+        tool = ExecTool(cmd_whitelist=["ls"], workspace=tmp_path)
+        tool.execute(command="ls")
+
+        env = captured["env"]
+        assert env is not None, "ExecTool must pass explicit env to subprocess.run"
+        assert "ANTHROPIC_API_KEY" not in env
+        assert canary not in env.values()
 
 
 # ============================================================

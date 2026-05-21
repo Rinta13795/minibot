@@ -25,17 +25,32 @@ import select
 import subprocess
 from typing import Any
 
+from minibot.tools import safe_subprocess_env
+
 # 单行 JSON 上限（16 MB）— 真实 MCP 工具响应远小于这个值
 DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024
 
 
 class MCPServerConfig:
-    """单个 MCP Server 的启动配置（值对象）。"""
+    """单个 MCP Server 的启动配置（值对象）。
 
-    def __init__(self, name: str, command: str, args: list[str]) -> None:
+    env: 可选的环境变量字典。**会与 safe_subprocess_env() 的最小集合合并**——
+    子进程默认看不到 ANTHROPIC_API_KEY 等敏感凭据；如果某个 MCP server
+    确实需要 API key，调用方应在此字段显式提供（例如 GitHub MCP 需要
+    GITHUB_TOKEN），而不是依赖父进程环境继承。
+    """
+
+    def __init__(
+        self,
+        name: str,
+        command: str,
+        args: list[str],
+        env: dict[str, str] | None = None,
+    ) -> None:
         self.name = name
         self.command = command
         self.args = args
+        self.env = env or {}
 
 
 class MCPClient:
@@ -60,6 +75,9 @@ class MCPClient:
         启动失败的 server 会抛异常并冒泡，调用方自己决定是否吞掉。
         """
         for srv in self._servers:
+            # 最小 env + 按 server 显式声明的覆盖。绝对不继承父进程的
+            # ANTHROPIC_API_KEY / AWS_* / *_TOKEN 等敏感凭据。
+            child_env = {**safe_subprocess_env(), **srv.env}
             proc = subprocess.Popen(
                 [srv.command] + srv.args,
                 stdin=subprocess.PIPE,
@@ -67,6 +85,7 @@ class MCPClient:
                 stderr=subprocess.DEVNULL,
                 text=False,                 # 二进制模式，避免 \r\n 平台差异
                 bufsize=0,
+                env=child_env,
             )
             self._processes[srv.name] = proc
 
