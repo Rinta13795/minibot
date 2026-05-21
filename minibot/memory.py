@@ -50,34 +50,65 @@ class MemoryStore:
 
     DEFAULT_SECTIONS: tuple[str, ...] = ("user", "project", "feedback", "reference")
 
+    # 持久化白名单的元数据注释。写文件时由 _render_sections 自动生成；
+    # 读文件时由 _read_metadata_into_known_sections 提取。绝不通过扫描
+    # body 内的 ## X 来推断白名单，因为那样会把 user 在 body 里写的
+    # Markdown 二级标题（例如 "## 早安风格"）当成合法 section 加入集合，
+    # 后续 read 就会把它切回 section，重新引入 #4 的拆分 bug。
+    _SECTIONS_META_PREFIX = "<!-- minibot-sections: "
+    _SECTIONS_META_SUFFIX = " -->"
+
     def __init__(self, workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         self.memory_path = workspace / "MEMORY.md"
         # 已知合法的 section 名集合 — _parse_sections 用它过滤 ## 标题：
         # 在集合中的 ## X 视为 section 边界；不在集合中的 ## X 视为
         # section body 里的 Markdown 二级标题，不切分。
-        #
-        # 初始集合 = DEFAULT_SECTIONS，下面会再从磁盘上已有的 ## 标题里
-        # 扫描出 write_section 创建过的自定义 section 加入集合，保证重启
-        # 后旧的自定义 section 仍能被识别。
         self._known_sections: set[str] = set(self.DEFAULT_SECTIONS)
         if self.memory_path.exists():
-            self._seed_known_sections_from_disk()
+            self._initialize_known_sections_from_disk()
         else:
-            self.write_all(self._render_sections([(name, "") for name in self.DEFAULT_SECTIONS]))
+            # 新建空骨架（包含元数据行）
+            self.write_all(self._render_sections(
+                [(name, "") for name in self.DEFAULT_SECTIONS]
+            ))
 
-    def _seed_known_sections_from_disk(self) -> None:
-        """启动时把磁盘上已有的 ## 标题登记到 _known_sections。
+    def _initialize_known_sections_from_disk(self) -> None:
+        """启动时恢复 _known_sections。
 
-        这一步只在 __init__ 跑一次，保证旧 MEMORY.md 文件里通过
-        write_section 创建的自定义 section（比如 "history"、"zeta"）
-        在重启后仍能被识别。注意：如果旧文件因 pre-fix bug 已经被
-        污染（body 里混入了 ## X 被误切成 section），重启时会把那个
-        X 也当成 known section；该 case 需要人工清理。
+        优先读元数据注释行——minibot 写入的权威源；它只包含通过
+        write_section / append_entry 显式创建的 section 名。不会被
+        body 里的 Markdown 二级标题污染。
+
+        如果文件没有元数据（旧 MEMORY.md / 用户手编辑），做一次性
+        迁移：扫描所有 ## 标题加入白名单，立即用新格式（含元数据）
+        重写文件。迁移后任何新写入都不会再把 body subheading 当成
+        section。
         """
         content = self.memory_path.read_text(encoding="utf-8")
+        if self._read_metadata_into_known_sections(content):
+            return
+        # 旧文件 — 信任当前 ## 结构做迁移（这只发生一次）
         for m in re.finditer(r"^##\s+(.+?)\s*$", content, flags=re.MULTILINE):
             self._known_sections.add(m.group(1).strip())
+        sections = self._parse_sections(content)
+        # 立即用新格式写回，下次启动就走元数据路径
+        self.write_all(self._render_sections(sections))
+
+    def _read_metadata_into_known_sections(self, content: str) -> bool:
+        """从文件内容里找元数据行；找到则把名字加入 _known_sections，返回 True。"""
+        prefix = self._SECTIONS_META_PREFIX
+        suffix = self._SECTIONS_META_SUFFIX
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(prefix) and stripped.endswith(suffix):
+                names_csv = stripped[len(prefix): -len(suffix)]
+                for name in names_csv.split(","):
+                    name = name.strip()
+                    if name:
+                        self._known_sections.add(name)
+                return True
+        return False
 
     # ---------- 文件锁 ----------
 
@@ -259,9 +290,13 @@ class MemoryStore:
             sections.append((name, body))
         return sections
 
-    @staticmethod
-    def _render_sections(sections: list[tuple[str, str]]) -> str:
-        lines = ["# MEMORY.md", ""]
+    def _render_sections(self, sections: list[tuple[str, str]]) -> str:
+        # 把当前白名单写进元数据注释行作为权威源。已写入磁盘的所有
+        # 合法 section 名（含 DEFAULT_SECTIONS + 自定义）都在这里，重启
+        # 读这条注释就能恢复，完全不依赖扫描 ## X 标题。
+        meta_csv = ",".join(sorted(self._known_sections))
+        meta_line = f"{self._SECTIONS_META_PREFIX}{meta_csv}{self._SECTIONS_META_SUFFIX}"
+        lines = ["# MEMORY.md", "", meta_line, ""]
         for name, body in sections:
             lines.append(f"## {name}")
             if body:

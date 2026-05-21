@@ -179,3 +179,42 @@ class TestMemoryStore:
         store2 = MemoryStore(workspace=tmp_path)
         assert "zeta" in store2.list_sections()
         assert store2.read_section("zeta") == "z-content"
+
+    def test_body_h2_survives_process_restart(self, tmp_path: Path) -> None:
+        """关键回归：body 里写了 `## 早安风格` 后进程重启，重新加载
+        MEMORY.md 也不能把 `## 早安风格` 当成 section 切走。
+
+        早期的 _seed_known_sections_from_disk 实现会扫描所有 ## 标题
+        并加入白名单，导致 body 里的二级标题被错误地视为合法 section
+        →重启后 read_section("user") 只拿到 subheading 之前的内容。
+        正确实现下，权威白名单只来自元数据注释，不依赖磁盘上的 ## X。
+        """
+        body = "我的写作偏好：\n## 早安风格\n阳光\n## 晚安风格\n安静"
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", body)
+        # 第一次 read 已经在 PR 中验证过
+        assert store.read_section("user") == body
+
+        # 模拟进程重启
+        store2 = MemoryStore(workspace=tmp_path)
+        assert "早安风格" not in store2.list_sections()
+        assert "晚安风格" not in store2.list_sections()
+        assert store2.read_section("user") == body
+
+    def test_legacy_file_without_metadata_migrated_on_open(
+        self, tmp_path: Path
+    ) -> None:
+        """旧文件（无元数据注释，含自定义 section）首次打开后应自动迁移
+        到含元数据的新格式，自定义 section 不丢失。"""
+        memory_path = tmp_path / "MEMORY.md"
+        # 模拟一个 pre-fix 旧文件
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nalice\n\n## zeta\nz\n",
+            encoding="utf-8",
+        )
+        store = MemoryStore(workspace=tmp_path)
+        assert store.read_section("zeta") == "z"
+        # 文件应已被改写包含元数据行
+        new_content = memory_path.read_text(encoding="utf-8")
+        assert MemoryStore._SECTIONS_META_PREFIX in new_content
+        assert "zeta" in new_content
