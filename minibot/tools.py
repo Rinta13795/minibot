@@ -62,6 +62,19 @@ COMMAND_SPLICE_TOKENS: tuple[str, ...] = (
 #   - pip / pip3                            → 安装包会执行构建代码
 #   - curl / wget / ssh / scp / nc          → 数据外传、内网访问、payload 下载
 # 文件读取类（cat / grep / find）单独拒绝，因为它们能绕过 ReadFileTool.allowed_paths。
+def _executable_basename(name: str) -> str:
+    """从命令/路径中提取可执行文件名用于安全比较。
+
+    将 "/usr/bin/python3"、"./python3"、"..\\python3.exe" 等都归一为
+    "python3"（Windows 上同时去掉 .exe）。这是防止
+    DANGEROUS_EXECUTORS 字面量集合校验被路径前缀绕过的关键。
+    """
+    base = os.path.basename(name.strip())
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    return base
+
+
 DANGEROUS_EXECUTORS: frozenset[str] = frozenset({
     "sh", "bash", "zsh", "dash", "ksh", "fish",
     "python", "python3", "node", "ruby", "perl", "php", "lua",
@@ -136,7 +149,14 @@ class ExecTool(Tool):
         whitelist_set = set(cmd_whitelist)
         # 启动时拒绝危险解释器/shell/网络/版本控制工具进入白名单。
         # 这些命令能从内部穿透 shell=False、拼接符防护、文件路径白名单。
-        unsafe = whitelist_set & DANGEROUS_EXECUTORS
+        #
+        # 必须按 basename 比较，否则攻击者可以用 "/usr/bin/python3" 或
+        # "./python3" 绕过字面量集合检查（构造期不命中，但 execute() 阶段
+        # tokens[0] 仍等于该路径，进入白名单后被实际执行）。
+        unsafe = {
+            entry for entry in whitelist_set
+            if _executable_basename(entry) in DANGEROUS_EXECUTORS
+        }
         if unsafe:
             raise ValueError(
                 "cmd_whitelist contains dangerous executors that can bypass "
@@ -200,6 +220,10 @@ class ExecTool(Tool):
             return "Error: exec tool disabled (whitelist empty)"
         if tokens[0] not in self.cmd_whitelist:
             return f"Error: command '{tokens[0]}' not in whitelist"
+        # 运行时再按 basename 检查一次，兜底以防 cmd_whitelist 通过未来某种
+        # 渠道（动态修改、绕过 __init__）进入危险状态。
+        if _executable_basename(tokens[0]) in DANGEROUS_EXECUTORS:
+            return f"Error: command '{tokens[0]}' resolves to a dangerous executor"
 
         # 4) 真正执行
         try:

@@ -55,6 +55,27 @@ class TestExecTool:
         tool = ExecTool(cmd_whitelist=["ls", "echo", "pwd"], workspace=tmp_path)
         assert "ls" in tool.cmd_whitelist
 
+    @pytest.mark.parametrize(
+        "disguised",
+        [
+            "/usr/bin/python3",
+            "/usr/local/bin/python3",
+            "./python3",
+            "../bin/python3",
+            "/bin/bash",
+            "/usr/bin/git",
+            "/usr/bin/cat",
+            "python3.exe",          # Windows 风格
+            "/opt/tools/python3.EXE",
+        ],
+    )
+    def test_rejects_path_prefixed_dangerous_executor(
+        self, tmp_path: Path, disguised: str
+    ) -> None:
+        # 路径前缀和 .exe 后缀都不能绕过 basename 校验
+        with pytest.raises(ValueError, match="dangerous executors"):
+            ExecTool(cmd_whitelist=["ls", disguised], workspace=tmp_path)
+
     def test_dangerous_executors_constant_covers_required_set(self) -> None:
         # 安全审计要求的最小拒绝集（如果将来误删，此测试会提醒）
         must_block = {
