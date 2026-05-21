@@ -11,7 +11,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from minibot.tools import ExecTool, ReadFileTool, ToolRegistry, WriteFileTool
+import pytest
+
+from minibot.tools import (
+    ExecTool,
+    ReadFileTool,
+    ToolRegistry,
+    WriteFileTool,
+    validate_allowed_paths,
+)
 
 
 # ============================================================
@@ -62,6 +70,68 @@ class TestReadFileTool:
     def test_missing_file_returns_error(self, tmp_path: Path) -> None:
         tool = ReadFileTool(allowed_paths=[tmp_path])
         assert tool.execute(path=str(tmp_path / "nope.txt")).startswith("Error")
+
+
+# ============================================================
+# allowed_paths 过宽校验
+# ============================================================
+
+
+class TestBroadAllowedPaths:
+    @pytest.mark.parametrize(
+        "broad",
+        ["/", "/var", "/tmp", "/etc", "/usr", "/opt", "/Users", "/home"],
+    )
+    def test_read_file_rejects_broad_paths(self, broad: str) -> None:
+        with pytest.raises(ValueError, match="too broad"):
+            ReadFileTool(allowed_paths=[Path(broad)])
+
+    @pytest.mark.parametrize(
+        "broad",
+        ["/", "/var", "/tmp", "/etc"],
+    )
+    def test_write_file_rejects_broad_paths(self, broad: str) -> None:
+        with pytest.raises(ValueError, match="too broad"):
+            WriteFileTool(allowed_paths=[Path(broad)])
+
+    def test_rejects_user_home(self) -> None:
+        home = Path.home()
+        with pytest.raises(ValueError, match="too broad"):
+            ReadFileTool(allowed_paths=[home])
+
+    def test_allow_broad_paths_override(self, tmp_path: Path) -> None:
+        """显式 allow_broad_paths=True 时应允许任意路径（包括 /）。"""
+        tool = ReadFileTool(allowed_paths=[Path("/")], allow_broad_paths=True)
+        # 仅校验构造不抛；实际读取会被 path 检查约束
+        assert Path("/").resolve() in tool.allowed_paths
+
+    def test_workspace_subdirectory_allowed(self, tmp_path: Path) -> None:
+        """正常 workspace 子目录不应触发 broad 检查（即使在 /var 之下，
+        因为 tmp_path 是具体子路径而非 /var 本身）。"""
+        tool = ReadFileTool(allowed_paths=[tmp_path])
+        assert tmp_path.resolve() in tool.allowed_paths
+
+    def test_macos_var_symlink_handled(self) -> None:
+        """macOS 下 /tmp 与 /var 都 symlink 到 /private/* —— resolve 后的
+        路径也必须命中 broad 集合（用户写 "/tmp" 不能用 macOS 路径 quirk
+        绕过）。"""
+        # /tmp 直接拦截
+        with pytest.raises(ValueError, match="too broad"):
+            ReadFileTool(allowed_paths=[Path("/tmp")])
+        # /private/tmp（macOS resolve 形式）也拦截
+        if Path("/private/tmp").exists():
+            with pytest.raises(ValueError, match="too broad"):
+                ReadFileTool(allowed_paths=[Path("/private/tmp")])
+
+    def test_validate_allowed_paths_helper_directly(self, tmp_path: Path) -> None:
+        # 单元层级测试 helper
+        assert validate_allowed_paths([tmp_path]) == {tmp_path.resolve()}
+        with pytest.raises(ValueError):
+            validate_allowed_paths([Path("/")])
+        # bypass
+        assert validate_allowed_paths(
+            [Path("/")], allow_broad=True
+        ) == {Path("/").resolve()}
 
 
 # ============================================================

@@ -54,6 +54,72 @@ COMMAND_SPLICE_TOKENS: tuple[str, ...] = (
 )
 
 
+# 不允许直接进入 ReadFileTool / WriteFileTool 的 allowed_paths 的过宽路径。
+# 部署者为了方便经常配 "/" / "/var" / "$HOME"，让文件工具实际等同于
+# 整盘读写——allowed_paths 形同虚设。除非显式 allow_broad_paths=True，
+# 否则这里启动期就拒绝。
+_BROAD_PATH_CANDIDATES: tuple[str, ...] = (
+    "/",
+    "/home",
+    "/Users",
+    "/var",
+    "/tmp",
+    "/etc",
+    "/usr",
+    "/usr/local",
+    "/opt",
+    "/root",
+    "/srv",
+    "/private",       # macOS /tmp /var 都 symlink 到 /private/*
+    "/private/tmp",
+    "/private/var",
+    "/private/etc",
+)
+
+
+def _compute_broad_paths() -> set[Path]:
+    """计算 broad path 集合（含 resolve 后的形式）+ 用户 HOME。
+
+    在运行时计算而非硬编码 Path 对象，是因为 Path("/tmp").resolve() 在
+    macOS 上变成 Path("/private/tmp")，用户写 "/tmp" 也要被拦截。
+    """
+    s: set[Path] = set()
+    for c in _BROAD_PATH_CANDIDATES:
+        try:
+            s.add(Path(c).resolve())
+        except OSError:
+            pass
+    try:
+        s.add(Path.home().resolve())
+    except (OSError, RuntimeError):
+        pass
+    return s
+
+
+def validate_allowed_paths(
+    paths: list[Path],
+    *,
+    allow_broad: bool = False,
+) -> set[Path]:
+    """resolve 并校验 allowed_paths 不是过宽路径。
+
+    Raises:
+        ValueError: 任一路径属于 broad set 且未设 allow_broad=True。
+    """
+    resolved = {p.resolve() for p in paths}
+    if allow_broad:
+        return resolved
+    broad = _compute_broad_paths()
+    overly_broad = resolved & broad
+    if overly_broad:
+        raise ValueError(
+            "allowed_paths too broad: "
+            f"{sorted(str(p) for p in overly_broad)}. "
+            "Set tool config 'allow_broad_paths: true' to override."
+        )
+    return resolved
+
+
 class Tool(ABC):
     """工具基类（对应 Nanobot agent/tools/base.py 的 Tool ABC）。
 
@@ -218,8 +284,11 @@ class ReadFileTool(Tool):
         allowed_paths: list[Path],
         max_bytes: int = 1_000_000,
         max_lines: int | None = None,
+        allow_broad_paths: bool = False,
     ) -> None:
-        self.allowed_paths = {path.resolve() for path in allowed_paths}
+        self.allowed_paths = validate_allowed_paths(
+            allowed_paths, allow_broad=allow_broad_paths
+        )
         self.max_bytes = max_bytes
         self.max_lines = max_lines if max_lines is not None else self.DEFAULT_MAX_LINES
 
@@ -314,8 +383,11 @@ class WriteFileTool(Tool):
         allowed_paths: list[Path],
         forbidden_extensions: list[str] | None = None,
         make_backup: bool = True,
+        allow_broad_paths: bool = False,
     ) -> None:
-        self.allowed_paths = {path.resolve() for path in allowed_paths}
+        self.allowed_paths = validate_allowed_paths(
+            allowed_paths, allow_broad=allow_broad_paths
+        )
         self.forbidden_extensions = {
             ext.lower() if ext.startswith(".") else "." + ext.lower()
             for ext in (forbidden_extensions or []) if ext
