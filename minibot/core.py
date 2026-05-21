@@ -47,6 +47,7 @@ class MiniBotCore:
         model: str = "claude-sonnet-4-5",
         max_iterations: int = 10,
         max_history_messages: int = 40,
+        max_tool_result_chars: int = 20_000,
     ) -> None:
         self.workspace = workspace
         self.config = config
@@ -56,6 +57,11 @@ class MiniBotCore:
         # interactive 长会话 / 巨型工具输出 / 多次 MCP 大响应都会堆积
         # messages，最终撞 Anthropic 的 context window 限额报错。
         self.max_history_messages = max_history_messages
+        # 单条工具结果字符上限。仅按消息数滑动窗口不够——一次 MCP 响应
+        # 最大可达 16MB（MCP 自身的 max_line_bytes），单条就能撑爆 context
+        # window。ReadFileTool 内部已有 max_bytes，但 ExecTool stdout 和
+        # MCP call_tool 结果不受限。在这里统一截断作为最后一道兜底。
+        self.max_tool_result_chars = max_tool_result_chars
 
         # Anthropic client
         self._client = anthropic.Anthropic(api_key=anthropic_api_key)
@@ -167,6 +173,7 @@ class MiniBotCore:
         model = config.get("model", "claude-sonnet-4-5")
         max_iterations = config.get("max_iterations", 10)
         max_history_messages = config.get("max_history_messages", 40)
+        max_tool_result_chars = config.get("max_tool_result_chars", 20_000)
 
         workspace_str = config.get("workspace", "./workspace")
         workspace = Path(workspace_str)
@@ -181,6 +188,7 @@ class MiniBotCore:
             model=model,
             max_iterations=max_iterations,
             max_history_messages=max_history_messages,
+            max_tool_result_chars=max_tool_result_chars,
         )
 
     # ------------------------------------------------------------------ system prompt
@@ -327,6 +335,9 @@ class MiniBotCore:
                 else:
                     result = self.tools.execute(block.name, block.input)
 
+                # 单条工具结果再大也别让它独自撑爆 context window。
+                result = self._truncate_tool_result(result)
+
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -336,6 +347,36 @@ class MiniBotCore:
             self.messages.append({"role": "user", "content": tool_results})
 
         raise RuntimeError(f"tool_use loop exceeded max_iterations={self.max_iterations}")
+
+    def _truncate_tool_result(self, result: str) -> str:
+        """单条工具结果超过 max_tool_result_chars 时截断，保留头尾两端。
+
+        Anthropic API 单条 tool_result 占用的 token 直接计入 context window；
+        滑动窗口 _compact_messages 只控制消息数，无法防范一条 16MB 的 MCP
+        响应或巨型 exec stdout 独自撑爆 context。
+
+        保留头尾两端是因为大输出通常关键信息分布在开头和末尾（错误堆栈
+        在前、退出状态在尾），中间是重复 / 进度日志，截掉对模型推理影响
+        最小。
+        """
+        if not isinstance(result, str):
+            return result
+        cap = self.max_tool_result_chars
+        if cap <= 0 or len(result) <= cap:
+            return result
+        # 头尾各保留一半，留 200 字符给省略提示
+        budget = max(cap - 200, cap // 2)
+        head_len = budget * 3 // 4
+        tail_len = budget - head_len
+        head = result[:head_len]
+        tail = result[-tail_len:] if tail_len > 0 else ""
+        omitted = len(result) - head_len - tail_len
+        return (
+            f"{head}\n"
+            f"\n[... truncated {omitted} characters; original {len(result)} chars, "
+            f"cap {cap} ...]\n\n"
+            f"{tail}"
+        )
 
     def _compact_messages(self) -> None:
         """滑动窗口截断：当 messages 超过 max_history_messages 时丢弃旧消息。

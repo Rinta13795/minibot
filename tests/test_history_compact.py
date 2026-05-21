@@ -146,6 +146,7 @@ def test_config_max_history_messages_passed_through(tmp_path: Path) -> None:
         "model": "test-model",
         "max_iterations": 3,
         "max_history_messages": 7,
+        "max_tool_result_chars": 1234,
         "tools": {},
         "skills": {"skills_dirs": []},
         "memory": {},
@@ -156,3 +157,91 @@ def test_config_max_history_messages_passed_through(tmp_path: Path) -> None:
 
     core = MiniBotCore.from_config(cfg_path)
     assert core.max_history_messages == 7
+    assert core.max_tool_result_chars == 1234
+
+
+# ============================================================
+# 单条工具结果截断
+# ============================================================
+
+
+def test_tool_result_under_cap_unchanged(core: MiniBotCore) -> None:
+    core.max_tool_result_chars = 1000
+    small = "short output"
+    assert core._truncate_tool_result(small) == small
+
+
+def test_tool_result_over_cap_truncated_with_marker(core: MiniBotCore) -> None:
+    core.max_tool_result_chars = 500
+    big = "A" * 50_000 + "MIDDLE_MARKER" + "B" * 50_000
+    out = core._truncate_tool_result(big)
+    assert len(out) < len(big)
+    assert len(out) <= core.max_tool_result_chars + 300  # 头尾 + 提示
+    assert "truncated" in out.lower()
+    # 头部应保留
+    assert out.startswith("A" * 10)
+    # 尾部应保留
+    assert out.endswith("B" * 10)
+    # 中间应被截掉
+    assert "MIDDLE_MARKER" not in out
+
+
+def test_tool_result_truncation_in_run_tool_loop(core: MiniBotCore) -> None:
+    """端到端：tool 返回巨型字符串时，appended 到 messages 的 tool_result
+    content 必须在 cap 范围内（含截断提示几百字符），不能让单条消息撑爆
+    context window。"""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    core.max_tool_result_chars = 200
+
+    # 在 ToolRegistry 里塞一个返回巨大字符串的假工具
+    class HugeTool:
+        @property
+        def name(self) -> str:
+            return "huge"
+
+        @property
+        def description(self) -> str:
+            return "returns a huge blob"
+
+        @property
+        def parameters(self) -> dict:
+            return {"type": "object", "properties": {}}
+
+        def execute(self, **_kwargs) -> str:
+            return "X" * 100_000
+
+        def to_schema(self) -> dict:
+            return {"name": self.name, "description": "", "input_schema": self.parameters}
+
+    core.tools.register(HugeTool())
+
+    def fake_create(**_kwargs):
+        # 第一次返回 tool_use；第二次基于 tool_result 返回 text
+        if not getattr(fake_create, "called", False):
+            fake_create.called = True
+            block = SimpleNamespace(
+                type="tool_use", name="huge", input={}, id="call_huge"
+            )
+            return SimpleNamespace(content=[block], stop_reason="tool_use")
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="done")],
+            stop_reason="end_turn",
+        )
+
+    with patch.object(core._client.messages, "create", side_effect=fake_create):
+        core.chat("trigger huge tool")
+
+    # 找到 tool_result 消息
+    tool_msgs = [
+        m for m in core.messages
+        if m["role"] == "user" and isinstance(m["content"], list)
+    ]
+    assert len(tool_msgs) == 1
+    content_blocks = tool_msgs[0]["content"]
+    assert len(content_blocks) == 1
+    result_text = content_blocks[0]["content"]
+    # 必须远小于原始 100KB
+    assert len(result_text) <= core.max_tool_result_chars + 300
+    assert "truncated" in result_text.lower()
