@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from minibot.tools import ExecTool, ReadFileTool, ToolRegistry, WriteFileTool
+import pytest
+
+from minibot.tools import DANGEROUS_EXECUTORS, ExecTool, ReadFileTool, ToolRegistry, WriteFileTool
 
 
 # ============================================================
@@ -35,6 +37,32 @@ class TestExecTool:
         tool = ExecTool(cmd_whitelist=["sleep"], workspace=tmp_path, timeout_sec=1)
         result = tool.execute(command="sleep 5")
         assert "timed out" in result.lower() or result.startswith("Error")
+
+    @pytest.mark.parametrize(
+        "dangerous",
+        ["python3", "bash", "sh", "git", "curl", "wget", "docker", "pip",
+         "cat", "grep", "find", "node", "ssh"],
+    )
+    def test_rejects_dangerous_executor_in_whitelist(
+        self, tmp_path: Path, dangerous: str
+    ) -> None:
+        # 这些命令进白名单会让 ExecTool 失去隔离能力，启动时必须 ValueError
+        with pytest.raises(ValueError, match="dangerous executors"):
+            ExecTool(cmd_whitelist=["ls", dangerous], workspace=tmp_path)
+
+    def test_safe_whitelist_initializes(self, tmp_path: Path) -> None:
+        # 安全命令应允许构造
+        tool = ExecTool(cmd_whitelist=["ls", "echo", "pwd"], workspace=tmp_path)
+        assert "ls" in tool.cmd_whitelist
+
+    def test_dangerous_executors_constant_covers_required_set(self) -> None:
+        # 安全审计要求的最小拒绝集（如果将来误删，此测试会提醒）
+        must_block = {
+            "sh", "bash", "python", "python3", "node", "ruby", "perl",
+            "git", "docker", "pip", "curl", "wget", "ssh",
+            "cat", "grep", "find",
+        }
+        assert must_block.issubset(DANGEROUS_EXECUTORS)
 
 
 # ============================================================

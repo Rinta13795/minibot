@@ -53,6 +53,27 @@ COMMAND_SPLICE_TOKENS: tuple[str, ...] = (
     "&&", "||", ";", "|", "$(", "`", ">", "<", "\n", "&",
 )
 
+# 禁止进入 cmd_whitelist 的解释器/shell/包管理器/容器/网络/版本控制工具。
+# 这些命令即使在 shell=False 下也能通过自身能力穿透白名单：
+#   - python3 / node / ruby / perl / php   → 任意代码执行、读环境变量、网络
+#   - sh / bash / zsh                       → 直接 shell 执行器
+#   - git                                   → 支持 `git -c alias.x=!cmd` shell alias、hooks
+#   - docker                                → 容器逃逸、挂载宿主、提权
+#   - pip / pip3                            → 安装包会执行构建代码
+#   - curl / wget / ssh / scp / nc          → 数据外传、内网访问、payload 下载
+# 文件读取类（cat / grep / find）单独拒绝，因为它们能绕过 ReadFileTool.allowed_paths。
+DANGEROUS_EXECUTORS: frozenset[str] = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "fish",
+    "python", "python3", "node", "ruby", "perl", "php", "lua",
+    "git", "docker", "podman", "kubectl",
+    "pip", "pip3", "npm", "pnpm", "yarn", "gem",
+    "curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "telnet",
+    "cat", "grep", "egrep", "fgrep", "rgrep", "find", "fd",
+    "head", "tail", "less", "more", "view", "vi", "vim", "nano", "emacs",
+    "awk", "sed", "xargs", "tee",
+    "eval", "exec", "env",
+})
+
 
 class Tool(ABC):
     """工具基类（对应 Nanobot agent/tools/base.py 的 Tool ABC）。
@@ -112,7 +133,17 @@ class ExecTool(Tool):
         timeout_sec: int = 30,
         blacklist_patterns: list[str] | None = None,
     ) -> None:
-        self.cmd_whitelist = set(cmd_whitelist)
+        whitelist_set = set(cmd_whitelist)
+        # 启动时拒绝危险解释器/shell/网络/版本控制工具进入白名单。
+        # 这些命令能从内部穿透 shell=False、拼接符防护、文件路径白名单。
+        unsafe = whitelist_set & DANGEROUS_EXECUTORS
+        if unsafe:
+            raise ValueError(
+                "cmd_whitelist contains dangerous executors that can bypass "
+                f"sandboxing: {sorted(unsafe)}. Use dedicated tools instead "
+                "(ReadFileTool for file reads, etc.)."
+            )
+        self.cmd_whitelist = whitelist_set
         self.workspace = workspace.resolve()
         self.timeout_sec = timeout_sec
         patterns = list(DEFAULT_BLACKLIST_PATTERNS)

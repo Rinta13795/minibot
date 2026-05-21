@@ -20,9 +20,10 @@ from minibot.tools import ExecTool, ReadFileTool
 class TestExecCommandAudit:
     @pytest.fixture
     def tool(self, tmp_path: Path) -> ExecTool:
-        # 给一个最大化的白名单，模拟\"最坏情况\"——白名单很宽时其他防线能不能拦
+        # 给一个最大化的白名单（但不含 DANGEROUS_EXECUTORS 拒绝的项），
+        # 模拟"最坏情况"——白名单较宽时其他防线（splice / blacklist regex）能不能拦
         return ExecTool(
-            cmd_whitelist=["ls", "cat", "echo", "rm", "chmod", "dd"],
+            cmd_whitelist=["ls", "echo", "rm", "chmod", "dd"],
             workspace=tmp_path,
         )
 
@@ -121,8 +122,12 @@ class TestAdditionalAttackSurface:
         assert result.startswith("Error")
 
     def test_fork_bomb(self, tmp_path: Path) -> None:
-        """经典 fork bomb :(){...} — 黑名单正则覆盖。"""
-        tool = ExecTool(cmd_whitelist=["bash"], workspace=tmp_path)
+        """经典 fork bomb :(){...} — splice token / 黑名单正则双重覆盖。
+
+        bash 已被 DANGEROUS_EXECUTORS 阻止进入白名单，这里改用安全命令；
+        命令本身因 `;` `|` `&` 拼接符已被先拦截。
+        """
+        tool = ExecTool(cmd_whitelist=["ls"], workspace=tmp_path)
         result = tool.execute(command=":(){ :|:& };:")
         assert result.startswith("Error")
 
