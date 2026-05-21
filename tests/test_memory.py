@@ -201,20 +201,54 @@ class TestMemoryStore:
         assert "晚安风格" not in store2.list_sections()
         assert store2.read_section("user") == body
 
-    def test_legacy_file_without_metadata_migrated_on_open(
+    def test_legacy_file_migration_writes_metadata_with_defaults_only(
         self, tmp_path: Path
     ) -> None:
-        """旧文件（无元数据注释，含自定义 section）首次打开后应自动迁移
-        到含元数据的新格式，自定义 section 不丢失。"""
+        """旧文件无元数据时，迁移采取保守策略：只信任 DEFAULT_SECTIONS。
+
+        这是有意为之——不扫描所有 ## X 加入白名单可避免 pre-fix bug
+        制造的 body-injected subheadings 被错误地"扶正"为 section。
+        代价是旧文件里自定义 section（zeta）会变成前一个默认 section
+        的 body 内容。
+        """
         memory_path = tmp_path / "MEMORY.md"
-        # 模拟一个 pre-fix 旧文件
         memory_path.write_text(
             "# MEMORY.md\n\n## user\nalice\n\n## zeta\nz\n",
             encoding="utf-8",
         )
         store = MemoryStore(workspace=tmp_path)
-        assert store.read_section("zeta") == "z"
-        # 文件应已被改写包含元数据行
+        # zeta 不再被视为合法 section
+        assert "zeta" not in store.list_sections()
+        # zeta 的内容被并入 user 的 body
+        assert "## zeta" in store.read_section("user")
+        assert "z" in store.read_section("user")
+        # 文件已重写为带元数据的新格式
         new_content = memory_path.read_text(encoding="utf-8")
         assert MemoryStore._SECTIONS_META_PREFIX in new_content
-        assert "zeta" in new_content
+
+    def test_legacy_file_with_body_injection_does_not_promote_to_section(
+        self, tmp_path: Path
+    ) -> None:
+        """关键回归：legacy 文件里 body 已含 `## 早安` 时（无论是 pre-fix
+        bug 制造的还是手编辑的），打开后**不能**把它当成新 section。
+        这正是 Codex review 指出的「legacy migration reintroduces the
+        reviewed split bug」场景。"""
+        memory_path = tmp_path / "MEMORY.md"
+        memory_path.write_text(
+            "# MEMORY.md\n\n"
+            "## user\n"
+            "我的偏好：\n"
+            "## 早安风格\n"
+            "你好\n\n"
+            "## project\n"
+            "p\n",
+            encoding="utf-8",
+        )
+        store = MemoryStore(workspace=tmp_path)
+        # 早安风格 不应进入白名单
+        assert "早安风格" not in store.list_sections()
+        # project 仍是合法 section
+        assert "project" in store.list_sections()
+        # 元数据写入后再启动，行为仍稳定
+        store2 = MemoryStore(workspace=tmp_path)
+        assert "早安风格" not in store2.list_sections()

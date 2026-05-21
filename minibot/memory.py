@@ -80,19 +80,23 @@ class MemoryStore:
         write_section / append_entry 显式创建的 section 名。不会被
         body 里的 Markdown 二级标题污染。
 
-        如果文件没有元数据（旧 MEMORY.md / 用户手编辑），做一次性
-        迁移：扫描所有 ## 标题加入白名单，立即用新格式（含元数据）
-        重写文件。迁移后任何新写入都不会再把 body subheading 当成
-        section。
+        如果文件没有元数据（旧 MEMORY.md / 外部手编辑），做**保守**
+        一次性迁移：仅信任 DEFAULT_SECTIONS，不扫描其他 ## X 加入
+        白名单。这避免了 pre-fix bug 把 body-injected `## 早安风格`
+        当成 orphan section 落盘的场景在迁移时被错误地"承认"，让 bug
+        在新代码下继续成立。
+
+        代价：旧文件里通过 write_section 显式建过的自定义 section
+        （如 "zeta"）首次打开后会变成上一个默认 section 的 body。
+        若需保留自定义 section，应手动在元数据注释里补上名字。
         """
         content = self.memory_path.read_text(encoding="utf-8")
         if self._read_metadata_into_known_sections(content):
             return
-        # 旧文件 — 信任当前 ## 结构做迁移（这只发生一次）
-        for m in re.finditer(r"^##\s+(.+?)\s*$", content, flags=re.MULTILINE):
-            self._known_sections.add(m.group(1).strip())
+        # 旧文件：不扫描 ## X 加入白名单（防止 body 注入被错误"扶正"）。
+        # 直接用 DEFAULT_SECTIONS 解析并写回新格式，此后任何新 ## 标题
+        # 都被视为 body 内容，除非通过 write_section 显式添加。
         sections = self._parse_sections(content)
-        # 立即用新格式写回，下次启动就走元数据路径
         self.write_all(self._render_sections(sections))
 
     def _read_metadata_into_known_sections(self, content: str) -> bool:
