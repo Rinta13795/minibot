@@ -118,3 +118,214 @@ class TestMemoryStore:
         store.update_section("user", "alice")
         assert store.get_section("user") == "alice"
         assert "alice" in store.read_memory()
+
+    def test_body_with_unknown_h2_heading_is_not_split(self, tmp_path: Path) -> None:
+        """body 里出现 `## 小标题`（非已知 section 名）不能被误切成新 section。"""
+        store = MemoryStore(workspace=tmp_path)
+        body_with_h2 = (
+            "我喜欢的格式如下：\n"
+            "## 早安风格\n"
+            "你好呀\n"
+            "## 晚安风格\n"
+            "晚安"
+        )
+        store.write_section("user", body_with_h2)
+
+        # 写入后 read 应拿回完整 body（含两个 ## 子标题）
+        assert store.read_section("user") == body_with_h2
+        # list_sections 不应把 "早安风格" / "晚安风格" 当成独立 section
+        sections = store.list_sections()
+        assert "早安风格" not in sections
+        assert "晚安风格" not in sections
+
+    def test_body_h2_survives_subsequent_write_to_other_section(
+        self, tmp_path: Path
+    ) -> None:
+        """body 里有 `## 小标题` 时，写其他 section 不能把它撕掉。
+
+        这是代码审查指出的核心 race window：原实现下，write_section("user")
+        在解析阶段把 body 内的 ## X 当 section 切走，再次写时只覆盖第一段，
+        造成「## X\\n...」内容残留为孤儿 section。
+        """
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", "前缀\n## 中间标题\n后缀")
+        # 再写另一个合法 section
+        store.write_section("project", "p")
+        # 再写 user，验证原来的 ## 中间标题 还在
+        store.write_section("user", "前缀\n## 中间标题\n后缀")
+
+        assert store.read_section("user") == "前缀\n## 中间标题\n后缀"
+        assert store.read_section("project") == "p"
+        assert "中间标题" not in store.list_sections()
+
+    def test_h2_matching_known_section_still_splits(self, tmp_path: Path) -> None:
+        """边角情况：body 里写一个文本恰好等于已知 section 名（如 ## project）。
+
+        这种情况下白名单方案仍会切分——这是已知的不可避免的歧义，必须由调
+        用方避免（或对内容做转义）。本测试只是把当前预期行为锁定下来，便于
+        将来如改成更稳健的结构化格式时及时发现。
+        """
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", "起头\n## project\n冒充")
+        # 当前行为：## project 会被识别为 section 边界
+        assert "## project" not in store.read_section("user")
+
+    def test_known_section_seeded_from_disk_on_reopen(self, tmp_path: Path) -> None:
+        """write_section("zeta") 写入后，新实例重新打开 MEMORY.md，
+        仍能识别 zeta 是合法 section。"""
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("zeta", "z-content")
+        # 模拟进程重启
+        store2 = MemoryStore(workspace=tmp_path)
+        assert "zeta" in store2.list_sections()
+        assert store2.read_section("zeta") == "z-content"
+
+    def test_body_h2_survives_process_restart(self, tmp_path: Path) -> None:
+        """关键回归：body 里写了 `## 早安风格` 后进程重启，重新加载
+        MEMORY.md 也不能把 `## 早安风格` 当成 section 切走。
+
+        早期的 _seed_known_sections_from_disk 实现会扫描所有 ## 标题
+        并加入白名单，导致 body 里的二级标题被错误地视为合法 section
+        →重启后 read_section("user") 只拿到 subheading 之前的内容。
+        正确实现下，权威白名单只来自元数据注释，不依赖磁盘上的 ## X。
+        """
+        body = "我的写作偏好：\n## 早安风格\n阳光\n## 晚安风格\n安静"
+        store = MemoryStore(workspace=tmp_path)
+        store.write_section("user", body)
+        # 第一次 read 已经在 PR 中验证过
+        assert store.read_section("user") == body
+
+        # 模拟进程重启
+        store2 = MemoryStore(workspace=tmp_path)
+        assert "早安风格" not in store2.list_sections()
+        assert "晚安风格" not in store2.list_sections()
+        assert store2.read_section("user") == body
+
+    def test_legacy_file_creates_backup_and_warns_on_demotion(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Legacy 文件含非默认 section 时，迁移必须：
+          - 落盘备份原文件到 MEMORY.md.legacy-backup.<时间戳>
+          - 通过 stderr 发出 warning，列出被降级的 section 名
+        这样 user 才能察觉、对照备份决定是否手动恢复。"""
+        memory_path = tmp_path / "MEMORY.md"
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nalice\n\n## zeta\nz\n",
+            encoding="utf-8",
+        )
+        MemoryStore(workspace=tmp_path)
+
+        backups = list(tmp_path.glob("MEMORY.md.legacy-backup.*"))
+        assert len(backups) == 1, "must create exactly one timestamped backup"
+        # 备份内容 == 原始 legacy 文件
+        body = backups[0].read_text(encoding="utf-8")
+        assert "## zeta" in body
+        assert "z" in body
+
+        captured = capsys.readouterr()
+        assert "zeta" in captured.err
+        assert "legacy" in captured.err.lower() or "demoting" in captured.err.lower()
+
+    def test_legacy_file_pure_defaults_no_backup_no_warn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """纯默认 section 的 legacy 文件迁移不应触发 backup / warning。"""
+        memory_path = tmp_path / "MEMORY.md"
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nalice\n\n## project\np\n",
+            encoding="utf-8",
+        )
+        MemoryStore(workspace=tmp_path)
+
+        backups = list(tmp_path.glob("MEMORY.md.legacy-backup*"))
+        assert backups == []
+        assert capsys.readouterr().err == ""
+
+    def test_second_legacy_migration_preserves_prior_backup(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """如果 legacy migration 在不同时间点触发两次（例如用户外部
+        删除了元数据后又编辑文件），两次的原始状态都必须保留。
+        覆盖旧 backup 会让前一次的迁移损失永远查不回来。"""
+        memory_path = tmp_path / "MEMORY.md"
+
+        # 第一次迁移：state #1
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nv1\n\n## zeta\nold-z\n",
+            encoding="utf-8",
+        )
+        MemoryStore(workspace=tmp_path)
+        capsys.readouterr()  # discard
+
+        # 用户手动删元数据 + 改文件，状态变为 state #2
+        # 为了让时间戳错开，stub 一下时间
+        import time as _time
+        _time.sleep(1.1)  # 让 strftime 拿到不同的秒
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nv2\n\n## omega\nnew-o\n",
+            encoding="utf-8",
+        )
+        MemoryStore(workspace=tmp_path)
+
+        backups = sorted(tmp_path.glob("MEMORY.md.legacy-backup.*"))
+        assert len(backups) == 2, (
+            f"two distinct migrations must produce two backups, got: "
+            f"{[b.name for b in backups]}"
+        )
+        bodies = [b.read_text(encoding="utf-8") for b in backups]
+        # 早的备份含 zeta/old-z；新的备份含 omega/new-o
+        all_text = "\n".join(bodies)
+        assert "old-z" in all_text
+        assert "new-o" in all_text
+
+    def test_legacy_file_migration_writes_metadata_with_defaults_only(
+        self, tmp_path: Path
+    ) -> None:
+        """旧文件无元数据时，迁移采取保守策略：只信任 DEFAULT_SECTIONS。
+
+        这是有意为之——不扫描所有 ## X 加入白名单可避免 pre-fix bug
+        制造的 body-injected subheadings 被错误地"扶正"为 section。
+        代价是旧文件里自定义 section（zeta）会变成前一个默认 section
+        的 body 内容。
+        """
+        memory_path = tmp_path / "MEMORY.md"
+        memory_path.write_text(
+            "# MEMORY.md\n\n## user\nalice\n\n## zeta\nz\n",
+            encoding="utf-8",
+        )
+        store = MemoryStore(workspace=tmp_path)
+        # zeta 不再被视为合法 section
+        assert "zeta" not in store.list_sections()
+        # zeta 的内容被并入 user 的 body
+        assert "## zeta" in store.read_section("user")
+        assert "z" in store.read_section("user")
+        # 文件已重写为带元数据的新格式
+        new_content = memory_path.read_text(encoding="utf-8")
+        assert MemoryStore._SECTIONS_META_PREFIX in new_content
+
+    def test_legacy_file_with_body_injection_does_not_promote_to_section(
+        self, tmp_path: Path
+    ) -> None:
+        """关键回归：legacy 文件里 body 已含 `## 早安` 时（无论是 pre-fix
+        bug 制造的还是手编辑的），打开后**不能**把它当成新 section。
+        这正是 Codex review 指出的「legacy migration reintroduces the
+        reviewed split bug」场景。"""
+        memory_path = tmp_path / "MEMORY.md"
+        memory_path.write_text(
+            "# MEMORY.md\n\n"
+            "## user\n"
+            "我的偏好：\n"
+            "## 早安风格\n"
+            "你好\n\n"
+            "## project\n"
+            "p\n",
+            encoding="utf-8",
+        )
+        store = MemoryStore(workspace=tmp_path)
+        # 早安风格 不应进入白名单
+        assert "早安风格" not in store.list_sections()
+        # project 仍是合法 section
+        assert "project" in store.list_sections()
+        # 元数据写入后再启动，行为仍稳定
+        store2 = MemoryStore(workspace=tmp_path)
+        assert "早安风格" not in store2.list_sections()
