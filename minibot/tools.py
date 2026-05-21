@@ -404,6 +404,21 @@ class WriteFileTool(Tool):
         # 备份原文件
         backup_path: Path | None = None
         if self.make_backup and target_resolved.exists():
+            # 现有文件可能远大于 max_content_bytes（用户手放 / 历史
+            # 遗留 / cap 后来调小）。shutil.copy2 不受 max_content_bytes
+            # 控制，一次写入就能凭空复制出一份巨大 .bak 撑爆磁盘。
+            # 这里先用 stat 检查，超 cap 即拒，杜绝 backup-driven 放大。
+            if self.max_content_bytes > 0:
+                try:
+                    existing_size = target_resolved.stat().st_size
+                except OSError as exc:
+                    return f"Error: failed to stat existing file: {exc}"
+                if existing_size > self.max_content_bytes:
+                    return (
+                        f"Error: existing file too large to back up safely "
+                        f"({existing_size} > {self.max_content_bytes} bytes); "
+                        f"delete or truncate it manually first"
+                    )
             backup_path = target_resolved.with_suffix(target_resolved.suffix + ".bak")
             try:
                 shutil.copy2(target_resolved, backup_path)
