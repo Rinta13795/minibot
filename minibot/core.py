@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,14 @@ class MiniBotCore:
 
         # Multi-turn conversation history
         self.messages: list[dict[str, Any]] = []
+
+        # 保护 self.messages 的并发访问。scheduler 触发的定时任务和 REPL
+        # 用户输入会在不同线程同时调用 chat()；如果不加锁，两条对话的
+        # user/assistant/tool_result 块会交错追加进同一个 messages 列表，
+        # 进而让 Anthropic API 收到非法的 tool_use 序列（HTTP 400）或者
+        # 把定时任务的 tool_result 灌进交互对话。RLock 允许同线程重入
+        # （例如 chat() 内部又触发 scheduler 回调），但跨线程互斥。
+        self._chat_lock = threading.RLock()
 
         # AGENTS.md — search workspace parent, then cwd
         self._agents_md_path = self._find_agents_md(workspace)
@@ -216,15 +225,20 @@ class MiniBotCore:
     # ------------------------------------------------------------------ public API
 
     def chat(self, user_message: str) -> str:
-        """单轮对话：发一条消息，跑完 tool_use 循环，返回最终回复。"""
-        self.messages.append({"role": "user", "content": user_message})
-        response = self._run_tool_loop()
+        """单轮对话：发一条消息，跑完 tool_use 循环，返回最终回复。
 
-        text_parts: list[str] = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                text_parts.append(block.text)
-        return "\n".join(text_parts)
+        全程持有 _chat_lock，确保 messages 列表的 append 序列对外原子可见；
+        并发的 scheduler tick 与 REPL 输入会被排队串行执行，而不是交错。
+        """
+        with self._chat_lock:
+            self.messages.append({"role": "user", "content": user_message})
+            response = self._run_tool_loop()
+
+            text_parts: list[str] = []
+            for block in response.content:
+                if hasattr(block, "text"):
+                    text_parts.append(block.text)
+            return "\n".join(text_parts)
 
     def interactive(self) -> None:
         """多轮交互式对话（REPL）。
@@ -249,7 +263,9 @@ class MiniBotCore:
             if user_input in ("/quit", "/exit"):
                 break
             if user_input == "/clear":
-                self.messages = []
+                # 必须持锁清空，否则在 scheduler 触发的 chat 中途清空会破坏其 tool_use 序列
+                with self._chat_lock:
+                    self.messages = []
                 print("Conversation cleared.")
                 continue
             if user_input == "/memory":
