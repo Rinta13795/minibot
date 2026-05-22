@@ -25,7 +25,8 @@
 
   "skills": {
     "skills_dir": "./skills",
-    "disabled": []
+    "disabled": [],
+    "_comment_security": "Keep skills_dir OUTSIDE write_file.allowed_paths. A writable skills_dir lets the LLM write a malicious always=true SKILL.md that gets injected into the system prompt. Startup warns on overlap; set allow_writable_skills_dir=true only if you accept the risk."
   },
 
   "memory": {

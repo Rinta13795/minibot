@@ -34,6 +34,46 @@ from typing import Any, Iterable
 import yaml
 
 
+def find_writable_skill_dirs(
+    skills_dirs: Iterable[Path],
+    writable_paths: Iterable[Path],
+) -> list[Path]:
+    """返回与任一可写路径重叠的 skills_dir（双向嵌套都算）。
+
+    安全背景：SKILL.md 的正文会被拼进 system prompt，always=true 的技能
+    甚至每轮都挂载，其优先级高于普通用户消息。如果某个 skills_dir 落在
+    write_file.allowed_paths 之下（或反之），LLM 就能通过 write_file 写入
+    一个恶意 SKILL.md，把任意指令稳定注入 system prompt——典型的提权 /
+    间接 prompt injection 路径。
+
+    判定规则（任一成立即视为重叠）：
+        - skills_dir == writable_path
+        - skills_dir 在 writable_path 之下（LLM 能直接往技能目录写文件）
+        - writable_path 在 skills_dir 之下（LLM 能往技能子目录写，重启后
+          被扫描成新技能）
+
+    路径都先 resolve，规避 symlink / 相对路径差异。
+    """
+    writable_resolved: list[Path] = []
+    for wp in writable_paths:
+        try:
+            writable_resolved.append(wp.resolve())
+        except OSError:
+            continue
+
+    overlapping: list[Path] = []
+    for sd in skills_dirs:
+        try:
+            sd_r = sd.resolve()
+        except OSError:
+            continue
+        for wp in writable_resolved:
+            if sd_r == wp or sd_r.is_relative_to(wp) or wp.is_relative_to(sd_r):
+                overlapping.append(sd_r)
+                break
+    return overlapping
+
+
 class SkillsLoader:
     """扫描 skills 目录，按需把 SKILL.md 注入 system prompt。"""
 

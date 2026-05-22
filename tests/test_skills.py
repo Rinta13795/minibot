@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from minibot.skills import SkillsLoader
+from minibot.skills import SkillsLoader, find_writable_skill_dirs
 
 
 def _write_skill(root: Path, name: str, body: str, *, always: bool = False, description: str = "") -> Path:
@@ -113,3 +113,108 @@ class TestSkillsLoader:
         assert loader.has_skill("greeting")
         body = loader.load_skill_body("greeting")
         assert "MiniBot" in body or "问候" in body
+
+
+class TestFindWritableSkillDirs:
+    def test_skills_dir_inside_writable_path_detected(self, tmp_path: Path) -> None:
+        """skills_dir 在 write 路径之下 → LLM 能直接往技能目录写。"""
+        workspace = tmp_path / "workspace"
+        skills = workspace / "skills"
+        skills.mkdir(parents=True)
+        overlap = find_writable_skill_dirs([skills], [workspace])
+        assert overlap == [skills.resolve()]
+
+    def test_writable_path_inside_skills_dir_detected(self, tmp_path: Path) -> None:
+        """write 路径在 skills_dir 之下 → LLM 能往技能子目录写，重启被扫描。"""
+        skills = tmp_path / "skills"
+        out = skills / "output"
+        out.mkdir(parents=True)
+        overlap = find_writable_skill_dirs([skills], [out])
+        assert overlap == [skills.resolve()]
+
+    def test_equal_paths_detected(self, tmp_path: Path) -> None:
+        overlap = find_writable_skill_dirs([tmp_path], [tmp_path])
+        assert overlap == [tmp_path.resolve()]
+
+    def test_disjoint_paths_no_overlap(self, tmp_path: Path) -> None:
+        skills = tmp_path / "skills"
+        ws = tmp_path / "workspace"
+        skills.mkdir()
+        ws.mkdir()
+        assert find_writable_skill_dirs([skills], [ws]) == []
+
+    def test_no_writable_paths_no_overlap(self, tmp_path: Path) -> None:
+        assert find_writable_skill_dirs([tmp_path], []) == []
+
+
+class TestCoreWritableSkillsGuard:
+    """core 启动期对 skills_dir 落入 write_file.allowed_paths 的告警。"""
+
+    @staticmethod
+    def _make_config(workspace: Path, skills_dir: Path, **skills_extra) -> dict:
+        return {
+            "workspace": str(workspace),
+            "model": "test",
+            "max_iterations": 3,
+            "identity": "test",
+            "tools": {
+                "exec": {"enabled": False, "cmd_whitelist": []},
+                "read_file": {"enabled": False, "allowed_paths": []},
+                "write_file": {"enabled": True, "allowed_paths": [str(workspace)]},
+            },
+            "skills": {"skills_dirs": [str(skills_dir)], **skills_extra},
+            "memory": {},
+            "mcp_servers": {},
+        }
+
+    def test_warns_when_skills_dir_writable(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        from minibot.core import MiniBotCore
+
+        skills_dir = tmp_path / "skills"  # 在 workspace(tmp_path) 之下，可写
+        skills_dir.mkdir()
+        config = self._make_config(tmp_path, skills_dir)
+        MiniBotCore(workspace=tmp_path, config=config, anthropic_api_key="k")
+
+        err = capsys.readouterr().err
+        assert "skills_dir is within write_file.allowed_paths" in err
+
+    def test_no_warn_when_skills_dir_outside_writable(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        from minibot.core import MiniBotCore
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        skills_dir = tmp_path / "skills_readonly"  # 在 workspace 之外
+        skills_dir.mkdir()
+        config = self._make_config(workspace, skills_dir)
+        MiniBotCore(workspace=workspace, config=config, anthropic_api_key="k")
+
+        assert "skills_dir is within" not in capsys.readouterr().err
+
+    def test_override_silences_warning(self, tmp_path: Path, capsys) -> None:
+        from minibot.core import MiniBotCore
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        config = self._make_config(
+            tmp_path, skills_dir, allow_writable_skills_dir=True
+        )
+        MiniBotCore(workspace=tmp_path, config=config, anthropic_api_key="k")
+
+        assert "skills_dir is within" not in capsys.readouterr().err
+
+    def test_no_warn_when_write_file_disabled(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        from minibot.core import MiniBotCore
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        config = self._make_config(tmp_path, skills_dir)
+        config["tools"]["write_file"]["enabled"] = False
+        MiniBotCore(workspace=tmp_path, config=config, anthropic_api_key="k")
+
+        assert "skills_dir is within" not in capsys.readouterr().err
