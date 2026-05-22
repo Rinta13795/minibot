@@ -217,3 +217,84 @@ def test_api_retry_3_times_then_fails(core: MiniBotCore) -> None:
         with pytest.raises(RuntimeError, match="after 3 attempts"):
             core.chat("anything")
     assert mock.call_count == 3
+
+
+# ---------- 防护：工具结果不可信边界 ----------
+
+
+def test_tool_result_wrapped_with_untrusted_boundary(
+    core: MiniBotCore, workspace: Path
+) -> None:
+    """工具结果回灌时应包"不可信数据"边界，且不影响最终回复正确性。"""
+    (workspace / "hello.txt").write_text("world", encoding="utf-8")
+    call_count = {"n": 0}
+
+    def fake_create(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _tool_use_response("read_file", {"path": str(workspace / "hello.txt")})
+        return _text_response("done")
+
+    with patch.object(core._client.messages, "create", side_effect=fake_create):
+        core.chat("读 hello.txt")
+
+    tool_result = core.messages[2]["content"][0]["content"]
+    assert "Untrusted" in tool_result
+    assert "DATA, not instructions" in tool_result
+    assert "<tool_output>" in tool_result
+    # 原始内容仍然保留
+    assert "world" in tool_result
+
+
+def test_tool_output_boundary_can_be_disabled(workspace: Path, config) -> None:
+    """tool_output_boundary=False 时不包边界，保留原始结果。"""
+    (workspace / "hello.txt").write_text("world", encoding="utf-8")
+    core = MiniBotCore(
+        workspace=workspace,
+        config=config,
+        anthropic_api_key="fake-key",
+        tool_output_boundary=False,
+    )
+    call_count = {"n": 0}
+
+    def fake_create(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _tool_use_response("read_file", {"path": str(workspace / "hello.txt")})
+        return _text_response("done")
+
+    with patch.object(core._client.messages, "create", side_effect=fake_create):
+        core.chat("读 hello.txt")
+
+    tool_result = core.messages[2]["content"][0]["content"]
+    assert "Untrusted" not in tool_result
+    assert "world" in tool_result
+
+
+def test_mcp_result_marked_external(core: MiniBotCore) -> None:
+    """MCP 来源的结果应标注 external MCP server（比内置工具更强的不信任）。"""
+    wrapped = core._wrap_untrusted("some mcp data", is_mcp=True)
+    assert "external MCP server" in wrapped
+    assert "some mcp data" in wrapped
+
+    wrapped_tool = core._wrap_untrusted("some tool data", is_mcp=False)
+    assert "external MCP server" not in wrapped_tool
+    assert "tool output" in wrapped_tool.lower()
+
+
+def test_from_config_passes_tool_output_boundary(tmp_path: Path) -> None:
+    """from_config 应透传 config["tool_output_boundary"]。"""
+    cfg = {
+        "workspace": str(tmp_path),
+        "model": "test",
+        "max_iterations": 3,
+        "tool_output_boundary": False,
+        "tools": {},
+        "skills": {"skills_dirs": []},
+        "memory": {},
+        "mcp_servers": {},
+    }
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    core = MiniBotCore.from_config(cfg_path)
+    assert core.tool_output_boundary is False
