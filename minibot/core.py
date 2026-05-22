@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -26,8 +28,10 @@ import anthropic
 from minibot.memory import MemoryStore
 from minibot.mcp_client import MCPClient, MCPServerConfig
 from minibot.scheduler import CronJob, Scheduler
-from minibot.skills import SkillsLoader
+from minibot.skills import SkillsLoader, find_writable_skill_dirs
 from minibot.tools import ExecTool, ReadFileTool, ToolRegistry, WriteFileTool
+
+_log = logging.getLogger(__name__)
 
 
 class MiniBotCore:
@@ -56,6 +60,7 @@ class MiniBotCore:
         self._client = anthropic.Anthropic(api_key=anthropic_api_key)
 
         # Tool registry
+        self._write_allowed_paths: set[Path] = set()
         self.tools = ToolRegistry()
         self._register_tools(config.get("tools", {}), workspace)
 
@@ -70,6 +75,12 @@ class MiniBotCore:
         elif isinstance(skills_dirs_raw, str):
             skills_dirs_raw = [skills_dirs_raw]
         skills_dirs = [self._resolve_path(p, workspace) for p in skills_dirs_raw]
+        # 安全检查：skills_dir 若落在 write_file.allowed_paths 之下，LLM 能
+        # 写恶意 SKILL.md 注入 system prompt。启动期检测并告警。
+        self._warn_if_skills_writable(
+            skills_dirs,
+            allow_override=bool(skills_cfg.get("allow_writable_skills_dir", False)),
+        )
         self.skills = SkillsLoader(skills_dirs)
 
         # MCP client
@@ -144,10 +155,37 @@ class MiniBotCore:
 
         write_cfg = tools_cfg.get("write_file", {})
         if write_cfg.get("enabled", False):
+            write_paths = resolve_paths(write_cfg.get("allowed_paths", []))
+            # 记录可写路径，供 _warn_if_skills_writable 检查 skills_dir 是否落在其中
+            self._write_allowed_paths = {p.resolve() for p in write_paths}
             self.tools.register(WriteFileTool(
-                allowed_paths=resolve_paths(write_cfg.get("allowed_paths", [])),
+                allowed_paths=write_paths,
                 forbidden_extensions=write_cfg.get("forbidden_extensions"),
             ))
+
+    def _warn_if_skills_writable(
+        self, skills_dirs: list[Path], *, allow_override: bool
+    ) -> None:
+        """skills_dir 落在 write_file.allowed_paths 内时告警（提示注入风险）。
+
+        write_file 未启用时无写入向量，跳过。allow_override=True 时表示部署者
+        已知风险并显式接受，静默。
+        """
+        if not self._write_allowed_paths or allow_override:
+            return
+        overlap = find_writable_skill_dirs(skills_dirs, self._write_allowed_paths)
+        if not overlap:
+            return
+        msg = (
+            "skills_dir is within write_file.allowed_paths: "
+            f"{sorted(str(p) for p in overlap)}. The LLM could write a malicious "
+            "always=true SKILL.md that is injected into the system prompt with "
+            "higher priority than user messages. Move skills_dir outside writable "
+            "paths (recommended: read-only dir), or set "
+            "skills.allow_writable_skills_dir=true to acknowledge and silence."
+        )
+        _log.warning(msg)
+        sys.stderr.write(f"[minibot.skills] {msg}\n")
 
     # ------------------------------------------------------------------ factory
 
