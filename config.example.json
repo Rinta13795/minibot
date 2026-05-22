@@ -2,6 +2,7 @@
   "workspace": "./workspace",
   "model": "claude-sonnet-4-5",
   "max_iterations": 10,
+  "tool_output_boundary": true,
 
   "identity": "你是 MiniBot，一个谨慎、礼貌、擅长查文档的助手。",
 
@@ -32,6 +33,7 @@
     "memory_file": "./workspace/MEMORY.md"
   },
 
+  "_comment_mcp": "MCP servers run as local subprocesses with MiniBot's privileges and their tool output is fed back to the LLM. Only enable servers from trusted sources. Tool output is wrapped with an untrusted-data boundary (tool_output_boundary) but that is mitigation, not a sandbox.",
   "mcp_servers": {},
 
   "scheduled_tasks": []
