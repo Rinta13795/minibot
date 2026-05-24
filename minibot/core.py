@@ -74,7 +74,12 @@ class MiniBotCore:
 
         # MCP client
         mcp_servers = [
-            MCPServerConfig(name=name, command=srv["command"], args=srv.get("args", []))
+            MCPServerConfig(
+                name=name,
+                command=srv["command"],
+                args=srv.get("args", []),
+                env=srv.get("env", {}),
+            )
             for name, srv in config.get("mcp_servers", {}).items()
         ]
         self.mcp_client = MCPClient(servers=mcp_servers)

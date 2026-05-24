@@ -54,6 +54,29 @@ COMMAND_SPLICE_TOKENS: tuple[str, ...] = (
 )
 
 
+def safe_subprocess_env(workspace: Path | None = None) -> dict[str, str]:
+    """返回用于子进程的最小化环境变量字典。
+
+    问题：subprocess.run / Popen 若不传 env 会继承 os.environ，
+    暴露 ANTHROPIC_API_KEY、AWS_*、GITHUB_TOKEN、数据库密码等敏感凭据
+    给被 LLM 调用的子进程（例如 LLM 让 ExecTool 跑 `env` 或读
+    /proc/self/environ，然后通过 stdout 把 key 回灌到对话历史）。
+
+    本函数返回只含最少变量的字典：
+      - PATH：让 execve 能定位常用命令
+      - HOME：很多工具按 HOME 找 cache/temp（指向 workspace 隔离）
+      - LANG / LC_ALL：保证子进程输出可被解码为 UTF-8
+
+    所有 *_TOKEN / *_KEY / *_SECRET / *_PASSWORD 等都不出现。
+    """
+    return {
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": str(workspace.resolve()) if workspace else "/tmp",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
 class Tool(ABC):
     """工具基类（对应 Nanobot agent/tools/base.py 的 Tool ABC）。
 
@@ -170,7 +193,7 @@ class ExecTool(Tool):
         if tokens[0] not in self.cmd_whitelist:
             return f"Error: command '{tokens[0]}' not in whitelist"
 
-        # 4) 真正执行
+        # 4) 真正执行 — env 走最小集合，杜绝 ANTHROPIC_API_KEY 等敏感变量被回传
         try:
             result = subprocess.run(
                 tokens,
@@ -179,6 +202,7 @@ class ExecTool(Tool):
                 capture_output=True,
                 text=True,
                 shell=False,
+                env=safe_subprocess_env(self.workspace),
             )
         except subprocess.TimeoutExpired:
             return f"Error: command timed out after {self.timeout_sec}s"
