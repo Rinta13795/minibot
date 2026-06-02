@@ -53,6 +53,47 @@ COMMAND_SPLICE_TOKENS: tuple[str, ...] = (
     "&&", "||", ";", "|", "$(", "`", ">", "<", "\n", "&",
 )
 
+# 禁止进入 cmd_whitelist 的解释器/shell/包管理器/容器/网络/版本控制工具。
+# 这些命令即使在 shell=False 下也能通过自身能力穿透白名单：
+#   - python3 / node / ruby / perl / php   → 任意代码执行、读环境变量、网络
+#   - sh / bash / zsh                       → 直接 shell 执行器
+#   - git                                   → 支持 `git -c alias.x=!cmd` shell alias、hooks
+#   - docker                                → 容器逃逸、挂载宿主、提权
+#   - pip / pip3                            → 安装包会执行构建代码
+#   - curl / wget / ssh / scp / nc          → 数据外传、内网访问、payload 下载
+# 文件读取类（cat / grep / find）单独拒绝，因为它们能绕过 ReadFileTool.allowed_paths。
+def _executable_basename(name: str) -> str:
+    """从命令/路径中提取可执行文件名用于安全比较。
+
+    归一化策略：
+      1. 去掉路径前缀（/usr/bin/python3 → python3）
+      2. 去掉 .exe 后缀（python3.EXE → python3）
+      3. 全部转为小写
+
+    第 3 步至关重要——macOS 默认 HFS+ 与 Windows NTFS 都是大小写不
+    敏感的，"Python3"、"PYTHON3" 都会实际执行 python3。若不归一化
+    大小写，DANGEROUS_EXECUTORS 字面量集合校验会被简单大小写变体
+    绕过。Linux 上 lower-case 比较虽然会带来微小误报风险，但
+    DANGEROUS_EXECUTORS 列出的都是众所周知小写命名的工具，可接受。
+    """
+    base = os.path.basename(name.strip())
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    return base.lower()
+
+
+DANGEROUS_EXECUTORS: frozenset[str] = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "fish",
+    "python", "python3", "node", "ruby", "perl", "php", "lua",
+    "git", "docker", "podman", "kubectl",
+    "pip", "pip3", "npm", "pnpm", "yarn", "gem",
+    "curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "telnet",
+    "cat", "grep", "egrep", "fgrep", "rgrep", "find", "fd",
+    "head", "tail", "less", "more", "view", "vi", "vim", "nano", "emacs",
+    "awk", "sed", "xargs", "tee",
+    "eval", "exec", "env",
+})
+
 
 class Tool(ABC):
     """工具基类（对应 Nanobot agent/tools/base.py 的 Tool ABC）。
@@ -112,7 +153,24 @@ class ExecTool(Tool):
         timeout_sec: int = 30,
         blacklist_patterns: list[str] | None = None,
     ) -> None:
-        self.cmd_whitelist = set(cmd_whitelist)
+        whitelist_set = set(cmd_whitelist)
+        # 启动时拒绝危险解释器/shell/网络/版本控制工具进入白名单。
+        # 这些命令能从内部穿透 shell=False、拼接符防护、文件路径白名单。
+        #
+        # 必须按 basename 比较，否则攻击者可以用 "/usr/bin/python3" 或
+        # "./python3" 绕过字面量集合检查（构造期不命中，但 execute() 阶段
+        # tokens[0] 仍等于该路径，进入白名单后被实际执行）。
+        unsafe = {
+            entry for entry in whitelist_set
+            if _executable_basename(entry) in DANGEROUS_EXECUTORS
+        }
+        if unsafe:
+            raise ValueError(
+                "cmd_whitelist contains dangerous executors that can bypass "
+                f"sandboxing: {sorted(unsafe)}. Use dedicated tools instead "
+                "(ReadFileTool for file reads, etc.)."
+            )
+        self.cmd_whitelist = whitelist_set
         self.workspace = workspace.resolve()
         self.timeout_sec = timeout_sec
         patterns = list(DEFAULT_BLACKLIST_PATTERNS)
@@ -169,6 +227,10 @@ class ExecTool(Tool):
             return "Error: exec tool disabled (whitelist empty)"
         if tokens[0] not in self.cmd_whitelist:
             return f"Error: command '{tokens[0]}' not in whitelist"
+        # 运行时再按 basename 检查一次，兜底以防 cmd_whitelist 通过未来某种
+        # 渠道（动态修改、绕过 __init__）进入危险状态。
+        if _executable_basename(tokens[0]) in DANGEROUS_EXECUTORS:
+            return f"Error: command '{tokens[0]}' resolves to a dangerous executor"
 
         # 4) 真正执行
         try:

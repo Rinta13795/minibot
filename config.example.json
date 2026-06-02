@@ -8,8 +8,9 @@
   "tools": {
     "exec": {
       "enabled": true,
-      "cmd_whitelist": ["ls", "cat", "grep", "find", "python3", "git"],
-      "timeout_sec": 30
+      "cmd_whitelist": ["ls", "echo"],
+      "timeout_sec": 30,
+      "_comment_whitelist": "WARNING: do not add python3, node, sh, bash, git, cat, grep, find, curl, wget, docker, pip, etc. They can bypass ExecTool sandboxing. Use ReadFileTool for file reads. See DANGEROUS_EXECUTORS in minibot/tools.py."
     },
     "read_file": {
       "enabled": true,
