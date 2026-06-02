@@ -91,6 +91,103 @@ class TestWriteFileTool:
         assert result.startswith("Error")
         assert not (tmp_path / "evil.sh").exists()
 
+    def test_blocks_oversize_content(self, tmp_path: Path) -> None:
+        """超过 max_content_bytes 的写入应被拒绝，文件不应创建。"""
+        tool = WriteFileTool(allowed_paths=[tmp_path], max_content_bytes=100)
+        target = tmp_path / "big.txt"
+        result = tool.execute(path=str(target), content="X" * 200)
+        assert result.startswith("Error")
+        assert "too large" in result.lower()
+        assert not target.exists()
+
+    def test_allows_content_at_size_limit(self, tmp_path: Path) -> None:
+        """正好等于 max_content_bytes 的内容应被允许。"""
+        tool = WriteFileTool(allowed_paths=[tmp_path], max_content_bytes=100)
+        target = tmp_path / "ok.txt"
+        result = tool.execute(path=str(target), content="X" * 100)
+        assert not result.startswith("Error")
+        assert target.read_text() == "X" * 100
+
+    def test_size_check_uses_utf8_byte_count_not_char_count(
+        self, tmp_path: Path
+    ) -> None:
+        """中文字符在 UTF-8 下占 3 字节。30 个中文 = 90 字节，应通过 cap=90。
+        但 31 个中文 = 93 字节，应被拦截。"""
+        tool = WriteFileTool(allowed_paths=[tmp_path], max_content_bytes=90)
+        # 30 个 "中" = 90 字节，刚好通过
+        result_ok = tool.execute(
+            path=str(tmp_path / "ok.txt"), content="中" * 30
+        )
+        assert not result_ok.startswith("Error"), result_ok
+        # 31 个 "中" = 93 字节，超过
+        result_over = tool.execute(
+            path=str(tmp_path / "over.txt"), content="中" * 31
+        )
+        assert result_over.startswith("Error")
+        assert "too large" in result_over.lower()
+        assert not (tmp_path / "over.txt").exists()
+
+    def test_size_limit_zero_disables_check(self, tmp_path: Path) -> None:
+        """max_content_bytes=0 时关闭大小检查（向后兼容）。"""
+        tool = WriteFileTool(allowed_paths=[tmp_path], max_content_bytes=0)
+        target = tmp_path / "any.txt"
+        result = tool.execute(path=str(target), content="X" * 10_000)
+        assert not result.startswith("Error")
+        assert target.exists()
+
+    def test_oversize_existing_file_blocks_backup_amplification(
+        self, tmp_path: Path
+    ) -> None:
+        """现有文件超过 max_content_bytes 时，写入必须被拒——否则
+        shutil.copy2 会把这个大文件复制到 .bak，凭空放大磁盘占用，
+        新 content 再小也阻止不了。"""
+        target = tmp_path / "huge.txt"
+        # 用工具旁路直接创建一个 200KB 的现有文件
+        target.write_bytes(b"X" * 200_000)
+
+        tool = WriteFileTool(allowed_paths=[tmp_path], max_content_bytes=100_000)
+        result = tool.execute(path=str(target), content="tiny")
+
+        assert result.startswith("Error")
+        assert "existing file too large" in result.lower()
+        # .bak 不应被创建
+        assert not (tmp_path / "huge.txt.bak").exists()
+        # 原文件未被修改
+        assert target.read_bytes() == b"X" * 200_000
+
+    def test_oversize_existing_file_no_block_when_backup_disabled(
+        self, tmp_path: Path
+    ) -> None:
+        """如果 make_backup=False，没有 shutil.copy2 放大风险，
+        允许覆写大现有文件（新 content 仍受 max_content_bytes 限制）。"""
+        target = tmp_path / "huge.txt"
+        target.write_bytes(b"X" * 200_000)
+
+        tool = WriteFileTool(
+            allowed_paths=[tmp_path],
+            max_content_bytes=100_000,
+            make_backup=False,
+        )
+        result = tool.execute(path=str(target), content="replacement")
+
+        assert not result.startswith("Error"), result
+        assert target.read_text() == "replacement"
+        assert not (tmp_path / "huge.txt.bak").exists()
+
+    def test_oversize_existing_check_skipped_when_cap_zero(
+        self, tmp_path: Path
+    ) -> None:
+        """cap=0（关闭检查）时，大现有文件也允许备份+写入（用户显式选择）。"""
+        target = tmp_path / "huge.txt"
+        target.write_bytes(b"X" * 200_000)
+
+        tool = WriteFileTool(allowed_paths=[tmp_path], max_content_bytes=0)
+        result = tool.execute(path=str(target), content="replacement")
+
+        assert not result.startswith("Error"), result
+        assert (tmp_path / "huge.txt.bak").exists()
+        assert (tmp_path / "huge.txt.bak").read_bytes() == b"X" * 200_000
+
 
 # ============================================================
 # ToolRegistry

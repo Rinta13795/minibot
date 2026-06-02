@@ -19,7 +19,8 @@
     "write_file": {
       "enabled": true,
       "allowed_paths": ["./workspace"],
-      "forbidden_extensions": [".sh", ".py", ".exe"]
+      "forbidden_extensions": [".sh", ".py", ".exe"],
+      "max_content_bytes": 1000000
     }
   },
 
