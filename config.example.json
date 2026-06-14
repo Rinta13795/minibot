@@ -2,6 +2,9 @@
   "workspace": "./workspace",
   "model": "claude-sonnet-4-5",
   "max_iterations": 10,
+  "max_history_messages": 40,
+  "max_tool_result_chars": 20000,
+  "max_aggregate_tool_result_chars": 80000,
 
   "identity": "你是 MiniBot，一个谨慎、礼貌、擅长查文档的助手。",
 

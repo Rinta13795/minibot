@@ -46,11 +46,29 @@ class MiniBotCore:
         anthropic_api_key: str,
         model: str = "claude-sonnet-4-5",
         max_iterations: int = 10,
+        max_history_messages: int = 40,
+        max_tool_result_chars: int = 20_000,
+        max_aggregate_tool_result_chars: int = 80_000,
     ) -> None:
         self.workspace = workspace
         self.config = config
         self.model = model
         self.max_iterations = max_iterations
+        # 滑动窗口上限——超过会在每次 API 调用前触发 _compact_messages。
+        # interactive 长会话 / 巨型工具输出 / 多次 MCP 大响应都会堆积
+        # messages，最终撞 Anthropic 的 context window 限额报错。
+        self.max_history_messages = max_history_messages
+        # 单条工具结果字符上限。仅按消息数滑动窗口不够——一次 MCP 响应
+        # 最大可达 16MB（MCP 自身的 max_line_bytes），单条就能撑爆 context
+        # window。ReadFileTool 内部已有 max_bytes，但 ExecTool stdout 和
+        # MCP call_tool 结果不受限。在这里统一截断作为最后一道兜底。
+        self.max_tool_result_chars = max_tool_result_chars
+        # 单次 assistant 转响里**所有** tool_result 字符总和的上限。
+        # 模型一次可以发起多个 tool_use 块，全部 tool_result 进同一条
+        # user message——单条 cap 限不住聚合（N × per_cap 仍可任意大）。
+        # 注：tool_use_id 必须 1:1 对应 tool_result，不能跳过；超额时只能
+        # 把每个 result 进一步截到 cap / N。
+        self.max_aggregate_tool_result_chars = max_aggregate_tool_result_chars
 
         # Anthropic client
         self._client = anthropic.Anthropic(api_key=anthropic_api_key)
@@ -161,6 +179,11 @@ class MiniBotCore:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         model = config.get("model", "claude-sonnet-4-5")
         max_iterations = config.get("max_iterations", 10)
+        max_history_messages = config.get("max_history_messages", 40)
+        max_tool_result_chars = config.get("max_tool_result_chars", 20_000)
+        max_aggregate_tool_result_chars = config.get(
+            "max_aggregate_tool_result_chars", 80_000
+        )
 
         workspace_str = config.get("workspace", "./workspace")
         workspace = Path(workspace_str)
@@ -174,6 +197,9 @@ class MiniBotCore:
             anthropic_api_key=api_key,
             model=model,
             max_iterations=max_iterations,
+            max_history_messages=max_history_messages,
+            max_tool_result_chars=max_tool_result_chars,
+            max_aggregate_tool_result_chars=max_aggregate_tool_result_chars,
         )
 
     # ------------------------------------------------------------------ system prompt
@@ -298,6 +324,10 @@ class MiniBotCore:
         tool_schemas = self.tools.get_schemas() + self.mcp_client.list_tools()
 
         for _ in range(self.max_iterations):
+            # 每次 API 调用前做滑动窗口截断，避免 messages 无限增长撞
+            # Anthropic context window。只在每个迭代开始截断，保证 messages
+            # 此刻处于「完整对话单元」状态（user 输入，或 user(tool_result) 收尾）。
+            self._compact_messages()
             response = self._call_api_with_retry(system_prompt, tool_schemas)
 
             # Append assistant turn to history
@@ -316,15 +346,149 @@ class MiniBotCore:
                 else:
                     result = self.tools.execute(block.name, block.input)
 
+                # 单条工具结果再大也别让它独自撑爆 context window。
+                result = self._truncate_tool_result(result)
+
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": result,
                 })
 
+            # 再施加 aggregate cap：单条 cap 不够防 N × per_cap 聚合爆量。
+            tool_results = self._enforce_aggregate_cap(tool_results)
             self.messages.append({"role": "user", "content": tool_results})
 
         raise RuntimeError(f"tool_use loop exceeded max_iterations={self.max_iterations}")
+
+    def _truncate_text(self, text: str, cap: int) -> str:
+        """把 text 截到 ≤ cap 字符以内，保留头尾两端 + 省略提示。
+
+        严格保证 `len(output) <= cap`——这是 _enforce_aggregate_cap 算
+        per-result 预算时的关键不变式。否则当 cap 很小时（极大 N 下的
+        cap/N），marker 字符串本身的长度可能反而超过 cap，让聚合截断
+        无法守住 max_aggregate_tool_result_chars。
+
+        策略：
+          - cap == 0：返回空串（这是 aggregate cap < N 时的边界路径，
+            每个 tool_result 必须出现以保持 1:1 配对，但实际内容为空）
+          - cap 够大 → 头尾两段（3:1）+ 省略 marker
+          - cap 装不下 marker → 直接硬截
+          - 末尾再做一次 len(out) > cap 的兜底，截到原文前 cap 字符
+        """
+        if not isinstance(text, str):
+            return text
+        if cap <= 0:
+            return ""
+        if len(text) <= cap:
+            return text
+
+        # 选最短可读 marker（短 marker 让 head/tail 留更多预算）。
+        # 含 "truncated" 关键字便于 grep/测试。
+        marker_template = "\n[... truncated {} chars ...]\n"
+        sample_marker = marker_template.format(len(text))
+        marker_len = len(sample_marker)
+
+        if marker_len + 4 >= cap:
+            # cap 太小，连 marker 都装不下 → 硬截
+            return text[:cap]
+
+        body_budget = cap - marker_len
+        head_len = body_budget * 3 // 4
+        tail_len = body_budget - head_len
+        head = text[:head_len]
+        tail = text[-tail_len:] if tail_len > 0 else ""
+        omitted = len(text) - head_len - tail_len
+        out = f"{head}{marker_template.format(omitted)}{tail}"
+        # 安全兜底：理论上不会触发，但保证 len(out) <= cap 是 aggregate
+        # 算法依赖的硬约束
+        if len(out) > cap:
+            return text[:cap]
+        return out
+
+    def _truncate_tool_result(self, result: str) -> str:
+        """单条工具结果超过 max_tool_result_chars 时截断。"""
+        return self._truncate_text(result, self.max_tool_result_chars)
+
+    def _enforce_aggregate_cap(
+        self, tool_results: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """一次 turn 内全部 tool_result 聚合**严格** ≤ max_aggregate_tool_result_chars。
+
+        模型可以在同一个 assistant 回复里发出多个 tool_use 块，所有
+        tool_result 块进同一条 user message——单条 cap 限不住聚合。
+
+        关键约束：
+          - tool_use_id 与 tool_result 必须 1:1 配对（少了 API 400），
+            所以永远不能跳过任何 tool_result，只能进一步截短。
+          - 不能给 per_budget 设 floor（之前的 max(cap//n, 200) 让
+            N*200 > cap），否则极大 N 时会反向超额 cap。
+          - 依赖 _truncate_text 严格 ≤ cap 的不变式来保证总和。
+
+        算法：
+          1. 算原始 total；不超 cap 则直接返回
+          2. 否则 per_budget = cap // n（**无 floor**）
+          3. 每个 result 用 _truncate_text 截到 ≤ per_budget
+          4. 总和 = sum(min(L_i, per_budget)) ≤ n * per_budget ≤ cap ✓
+        """
+        cap = self.max_aggregate_tool_result_chars
+        if cap <= 0 or not tool_results:
+            return tool_results
+
+        def _content_len(r: dict[str, Any]) -> int:
+            c = r.get("content")
+            return len(c) if isinstance(c, str) else 0
+
+        total = sum(_content_len(r) for r in tool_results)
+        if total <= cap:
+            return tool_results
+
+        n = len(tool_results)
+        # 严格 = cap // n，**无 floor**。N 极大时 per_budget 可能为 0
+        # （cap < n 的病态配置）；此时每条 tool_result.content 退化成
+        # 空串，仍保留 tool_use_id ↔ tool_result 的 1:1 配对，
+        # 聚合 = 0 ≤ cap。任何抬底（哪怕 1）都会让 n * 1 > cap 反向超额。
+        per_budget = cap // n
+        adjusted: list[dict[str, Any]] = []
+        for r in tool_results:
+            content = r.get("content")
+            if isinstance(content, str) and len(content) > per_budget:
+                content = self._truncate_text(content, per_budget)
+            adjusted.append({**r, "content": content})
+        return adjusted
+
+    def _compact_messages(self) -> None:
+        """滑动窗口截断：当 messages 超过 max_history_messages 时丢弃旧消息。
+
+        关键正确性约束：Anthropic API 要求 assistant 的 tool_use 块与紧接
+        其后的 user tool_result 块必须配对。简单 messages[-N:] 切片可能让
+        kept[0] 是一条 user(tool_result) 但对应的 assistant(tool_use) 已被
+        丢弃，下次 API 请求立即 HTTP 400。
+
+        正确策略：从理想切点开始向后扫描，找第一条「fresh user 输入」
+        （role=user 且 content 是字符串，不是 tool_result 列表）作为安全
+        切点；之前的全部丢弃。这样保留的窗口永远从一个完整对话回合开始。
+
+        如果窗口里找不到任何 fresh user（极端情况：一次 tool_use 循环
+        产生超过 max_history_messages 条消息），不截断——下一轮 chat 调用
+        的新 user 输入会重新提供安全切点。
+        """
+        if len(self.messages) <= self.max_history_messages:
+            return
+
+        # 理想切点：保留尾部 max_history_messages 条
+        cut = len(self.messages) - self.max_history_messages
+
+        # 向后找第一条 fresh user 输入
+        while cut < len(self.messages):
+            msg = self.messages[cut]
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                break
+            cut += 1
+
+        if cut <= 0 or cut >= len(self.messages):
+            return  # 无可丢弃 / 无安全切点
+        self.messages = self.messages[cut:]
 
     def _call_api_with_retry(self, system_prompt: str, tool_schemas: list[dict[str, Any]]) -> Any:
         """调用 Anthropic API，失败时最多重试 3 次（指数退避）。"""
